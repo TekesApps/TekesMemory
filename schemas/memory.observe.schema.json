@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "user",
+            "workspace",
+            "thread"
+          ]
+        },
+        "owner_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "workspace_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "kind",
+        "owner_id"
+      ],
+      "additionalProperties": false
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "source_event": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "host_instance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "workspace_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "line_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "source_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "source_digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "host",
+        "host_instance_id",
+        "workspace_id",
+        "thread_id",
+        "line_id",
+        "event_id",
+        "source_seq",
+        "source_digest"
+      ],
+      "additionalProperties": false
+    },
+    "observation": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": [
+            "turn_opened",
+            "tool_result",
+            "context_checkpoint",
+            "turn_outcome",
+            "source_invalidated"
+          ]
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "turn_id": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 32768
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "host": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "digest": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "source_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  }
+                },
+                "required": [
+                  "host",
+                  "ref",
+                  "digest"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 64,
+              "minItems": 1
+            },
+            "outcome": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 512
+            },
+            "through_seq": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "covers": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "maxItems": 4096,
+              "minItems": 0
+            },
+            "manual": {
+              "type": "boolean"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "tool_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "source_keys": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "maxItems": 128,
+              "minItems": 1
+            }
+          },
+          "required": [
+            "turn_id",
+            "summary",
+            "sources"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "scope",
+    "idempotency_key",
+    "source_event",
+    "observation"
+  ],
+  "additionalProperties": false
+}

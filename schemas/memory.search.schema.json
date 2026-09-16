@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": [
+            "user",
+            "workspace",
+            "thread"
+          ]
+        },
+        "owner_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "workspace_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "kind",
+        "owner_id"
+      ],
+      "additionalProperties": false
+    },
+    "query": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 8192
+    },
+    "kinds": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "episode",
+          "fact",
+          "procedure"
+        ]
+      },
+      "maxItems": 3,
+      "minItems": 1
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_utf8_bytes": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 32768
+        },
+        "estimated_tokens": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 8192
+        }
+      },
+      "required": [
+        "max_items",
+        "max_utf8_bytes",
+        "estimated_tokens"
+      ],
+      "additionalProperties": false
+    },
+    "cursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    }
+  },
+  "required": [
+    "schema_version",
+    "scope",
+    "query",
+    "kinds",
+    "budget"
+  ],
+  "additionalProperties": false
+}

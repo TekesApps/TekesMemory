@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "host": {
+      "enum": [
+        "127.0.0.1"
+      ]
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "data_directory": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "episode_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3650
+    },
+    "allowed_origins": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      },
+      "maxItems": 32,
+      "minItems": 0
+    },
+    "principals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "role": {
+            "enum": [
+              "model",
+              "adapter"
+            ]
+          },
+          "owner_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "user",
+                    "workspace",
+                    "thread"
+                  ]
+                },
+                "owner_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "thread_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                }
+              },
+              "required": [
+                "kind",
+                "owner_id"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 256,
+            "minItems": 1
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "memory.search",
+                "memory.get",
+                "memory.save",
+                "memory.correct",
+                "memory.forget",
+                "memory.observe",
+                "memory.status"
+              ]
+            },
+            "maxItems": 7,
+            "minItems": 1
+          },
+          "token_sha256": {
+            "type": "string",
+            "pattern": "[a-f0-9]{64}"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "owner_id",
+          "scopes",
+          "tools",
+          "token_sha256"
+        ],
+        "additionalProperties": false
+      },
+      "maxItems": 256,
+      "minItems": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "host",
+    "port",
+    "data_directory",
+    "episode_days",
+    "allowed_origins",
+    "principals"
+  ],
+  "additionalProperties": false
+}

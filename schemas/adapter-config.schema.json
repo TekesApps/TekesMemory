@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "endpoint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "owner_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "host_instance_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "thread_root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "credential_file": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "request_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4500
+    },
+    "retrieval": {
+      "type": "object",
+      "properties": {
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_utf8_bytes": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 32768
+        },
+        "estimated_tokens": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 8192
+        }
+      },
+      "required": [
+        "max_items",
+        "max_utf8_bytes",
+        "estimated_tokens"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "endpoint",
+    "owner_id",
+    "workspace_id",
+    "host_instance_id",
+    "thread_root",
+    "credential_file",
+    "request_timeout_ms",
+    "retrieval"
+  ],
+  "additionalProperties": false
+}
