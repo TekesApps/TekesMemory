@@ -169,7 +169,38 @@ impl Inner {
                     return response(200, Some(rpc_error(id, -32602, "Unknown tool")), None);
                 }
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                match self.store.lock().unwrap().call(&p, name, &args) {
+                let effect_key = params
+                    .get("_meta")
+                    .and_then(|meta| meta.get("io.tekes/idempotencyKey"))
+                    .and_then(Value::as_str);
+                let result = if name == "memory.reconcile_effect" {
+                    let may_write = [
+                        "memory.save",
+                        "memory.correct",
+                        "memory.forget",
+                        "memory.observe",
+                    ]
+                    .iter()
+                    .any(|tool| {
+                        p["tools"]
+                            .as_array()
+                            .is_some_and(|tools| tools.contains(&json!(tool)))
+                    });
+                    if !may_write {
+                        Err(err("scope_denied"))
+                    } else {
+                        self.store
+                            .lock()
+                            .unwrap()
+                            .reconcile_effect(&p, args["idempotencyKey"].as_str().unwrap_or(""))
+                    }
+                } else {
+                    self.store
+                        .lock()
+                        .unwrap()
+                        .call_with_effect(&p, name, &args, effect_key)
+                };
+                match result {
                     Ok(data) => {
                         json!({"structuredContent":data,"content":[{"type":"text","text":canonical(&data)}],"isError":false})
                     }

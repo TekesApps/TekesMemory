@@ -14,6 +14,12 @@ pub struct Store {
     pub episode_days: i64,
     pub clock: fn() -> i64,
 }
+fn valid_effect_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
 pub fn words(s: &str) -> Vec<String> {
     use std::sync::LazyLock;
     static WORD: LazyLock<regex::Regex> =
@@ -97,6 +103,38 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
     pub fn call(&self, p: &Value, name: &str, a: &Value) -> Result<Value> {
+        self.call_with_effect(p, name, a, None)
+    }
+    pub fn reconcile_effect(&self, p: &Value, key: &str) -> Result<Value> {
+        if !valid_effect_key(key) {
+            return Err(err("invalid_argument"));
+        }
+        let row: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT scope,result FROM effect_receipts WHERE principal=? AND key=?",
+                params![text(p, "id")?, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((scope, result)) = row else {
+            return Ok(json!({"status":"not_found"}));
+        };
+        authorize(p, &serde_json::from_str(&scope)?)?;
+        let data: Value = serde_json::from_str(&result)?;
+        let envelope = json!({"structuredContent":data,"content":[{"type":"text","text":canonical(&data)}],"isError":false});
+        Ok(json!({"status":"confirmed","value":envelope}))
+    }
+    pub fn call_with_effect(
+        &self,
+        p: &Value,
+        name: &str,
+        a: &Value,
+        effect_key: Option<&str>,
+    ) -> Result<Value> {
+        if effect_key.is_some_and(|key| !valid_effect_key(key)) {
+            return Err(err("invalid_argument"));
+        }
         if !array(p, "tools")?.contains(&json!(name))
             || (name == "memory.observe" && p["role"] != "adapter")
         {
@@ -145,6 +183,22 @@ impl Store {
         let r = (|| {
             let scope = canonical(&a["scope"]);
             let dg = digest(&json!({"name":name,"args":a}));
+            if let Some(key) = effect_key {
+                let receipt: Option<(String, String)> = self
+                    .db
+                    .query_row(
+                        "SELECT digest,result FROM effect_receipts WHERE principal=? AND key=?",
+                        params![text(p, "id")?, key],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((prior_digest, prior_result)) = receipt {
+                    if prior_digest != dg {
+                        return Err(err("idempotency_conflict"));
+                    }
+                    return Ok(serde_json::from_str(&prior_result)?);
+                }
+            }
             let old: Option<(String, String)> = self
                 .db
                 .query_row(
@@ -153,35 +207,43 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            if let Some((d, r)) = old {
+            let r = if let Some((d, result)) = old {
                 if d != dg {
                     return Err(err("idempotency_conflict"));
                 }
-                return Ok(serde_json::from_str(&r)?);
-            }
-            let safe = scrub(a);
-            let mut r = match name {
-                "memory.save" => self.save(&safe)?,
-                "memory.correct" => self.correct(&safe)?,
-                "memory.forget" => self.forget(&safe)?,
-                "memory.observe" => self.observe(&safe)?,
-                _ => return Err(err("invalid_argument")),
+                serde_json::from_str(&result)?
+            } else {
+                let safe = scrub(a);
+                let mut r = match name {
+                    "memory.save" => self.save(&safe)?,
+                    "memory.correct" => self.correct(&safe)?,
+                    "memory.forget" => self.forget(&safe)?,
+                    "memory.observe" => self.observe(&safe)?,
+                    _ => return Err(err("invalid_argument")),
+                };
+                r["schema_version"] = json!(1);
+                r["request_id"] = json!(uid());
+                r["operation_id"] = json!(uid());
+                self.db.execute(
+                    "INSERT INTO operations VALUES(?,?,?,?,?,?)",
+                    params![
+                        text(&r, "operation_id")?,
+                        text(p, "id")?,
+                        &scope,
+                        text(a, "idempotency_key")?,
+                        &dg,
+                        canonical(&r)
+                    ],
+                )?;
+                self.bump()?;
+                r
             };
-            r["schema_version"] = json!(1);
-            r["request_id"] = json!(uid());
-            r["operation_id"] = json!(uid());
-            self.db.execute(
-                "INSERT INTO operations VALUES(?,?,?,?,?,?)",
-                params![
-                    text(&r, "operation_id")?,
-                    text(p, "id")?,
-                    scope,
-                    text(a, "idempotency_key")?,
-                    dg,
-                    canonical(&r)
-                ],
-            )?;
-            self.bump()?;
+            if let Some(key) = effect_key {
+                self.db.execute(
+                    "INSERT INTO effect_receipts VALUES(?,?,?,?,?)",
+                    params![text(p, "id")?, key, scope, dg, canonical(&r)],
+                )?;
+            }
             Ok(r)
         })();
         match r {

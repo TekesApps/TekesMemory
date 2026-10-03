@@ -36,6 +36,13 @@ pub static SCHEMAS: LazyLock<std::collections::BTreeMap<&'static str, Value>> =
                 serde_json::from_str(include_str!("../schemas/memory.search.schema.json")).unwrap(),
             ),
             (
+                "memory.reconcile_effect",
+                serde_json::from_str(include_str!(
+                    "../schemas/memory.reconcile_effect.schema.json"
+                ))
+                .unwrap(),
+            ),
+            (
                 "memory.status",
                 serde_json::from_str(include_str!("../schemas/memory.status.schema.json")).unwrap(),
             ),
@@ -76,8 +83,40 @@ pub fn tools_for(p: &Value) -> Value {
             "memory.status",
             "Read the processing state of your own operation.",
         ),
+        (
+            "memory.reconcile_effect",
+            "Read the durable outcome of a Kernel-authorized memory write.",
+        ),
     ]);
-    json!(SCHEMAS.iter().filter(|(n,_)|n.starts_with("memory.")&&p["tools"].as_array().is_some_and(|a|a.contains(&json!(n)))&&(**n!="memory.observe"||p["role"]=="adapter")).map(|(n,s)|json!({"name":n,"description":descriptions[n],"inputSchema":s,"annotations":{"readOnlyHint":matches!(*n,"memory.get"|"memory.search"|"memory.status"),"destructiveHint":matches!(*n,"memory.correct"|"memory.forget"),"idempotentHint":true,"openWorldHint":false}})).collect::<Vec<_>>())
+    let permitted = |name: &str| {
+        p["tools"]
+            .as_array()
+            .is_some_and(|a| a.contains(&json!(name)))
+    };
+    let has_write = [
+        "memory.save",
+        "memory.correct",
+        "memory.forget",
+        "memory.observe",
+    ]
+    .iter()
+    .any(|name| permitted(name));
+    json!(SCHEMAS.iter().filter(|(name,_)| {
+        name.starts_with("memory.") &&
+        (if **name == "memory.reconcile_effect" { has_write } else { permitted(name) }) &&
+        (**name != "memory.observe" || p["role"] == "adapter")
+    }).map(|(name,schema)| {
+        let read_only = matches!(*name,"memory.get"|"memory.search"|"memory.status"|"memory.reconcile_effect");
+        let mut tool = json!({"name":name,"description":descriptions[name],"inputSchema":schema,
+            "annotations":{"readOnlyHint":read_only,
+                "destructiveHint":matches!(*name,"memory.correct"|"memory.forget"),
+                "idempotentHint":true,"openWorldHint":false}});
+        if !read_only {
+            tool["_meta"] = json!({"io.tekes/externalEffect":{"version":1,
+                "reconcileTool":"memory.reconcile_effect"}});
+        }
+        tool
+    }).collect::<Vec<_>>())
 }
 pub fn service_config(path: &Path) -> Result<Value> {
     let c = private_json(path)?;
@@ -157,6 +196,7 @@ pub fn setup(dir: &Path, workspace: &str, thread_root: &Path, port: u16) -> Resu
             .keys()
             .filter(|n| {
                 n.starts_with("memory.")
+                    && **n != "memory.reconcile_effect"
                     && if role == "model" {
                         **n != "memory.observe"
                     } else {

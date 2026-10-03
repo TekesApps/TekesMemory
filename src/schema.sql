@@ -8,6 +8,9 @@
         CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(id UNINDEXED, words);
         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,principal TEXT,scope TEXT,key TEXT,
           digest TEXT,result TEXT,UNIQUE(principal,scope,key));
+        CREATE TABLE IF NOT EXISTS effect_receipts(principal TEXT NOT NULL,key TEXT NOT NULL,
+          scope TEXT NOT NULL,digest TEXT NOT NULL,result TEXT NOT NULL,
+          PRIMARY KEY(principal,key));
         CREATE TABLE IF NOT EXISTS observations(id TEXT PRIMARY KEY,scope TEXT,source_key TEXT,digest TEXT,
           payload TEXT,state TEXT,record_id TEXT,UNIQUE(scope,source_key,digest));
         CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,state TEXT NOT NULL,attempts INTEGER NOT NULL,
@@ -17,4 +20,3 @@
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         PRAGMA user_version=1;
         COMMIT;
-        

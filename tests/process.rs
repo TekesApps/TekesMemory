@@ -262,7 +262,53 @@ fn direct_mcp_session_lifecycle_and_cross_principal_reject() {
     )
     .json::<Value>()
     .unwrap();
-    assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7);
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let save_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "memory.save")
+        .unwrap();
+    assert_eq!(
+        save_tool["_meta"]["io.tekes/externalEffect"]["reconcileTool"],
+        "memory.reconcile_effect"
+    );
+    let reconcile_tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "memory.reconcile_effect")
+        .unwrap();
+    assert_eq!(reconcile_tool["annotations"]["readOnlyHint"], true);
+    let key = "b".repeat(64);
+    let arguments = json!({"schema_version":1,"scope":s.scope,"kind":"episode",
+        "content":"Confirmed PDF import repair","sources":[{"host":"test","ref":"run-1",
+        "digest":"a".repeat(64)}],"idempotency_key":"repair-1"});
+    let write = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+        "name":"memory.save","arguments":arguments,
+        "_meta":{"io.tekes/idempotencyKey":key}}});
+    let saved = post(s.token("model"), Some(&session), write.clone())
+        .json::<Value>()
+        .unwrap();
+    assert_eq!(saved["result"]["isError"], false);
+    let replay = post(s.token("model"), Some(&session), write)
+        .json::<Value>()
+        .unwrap();
+    assert_eq!(saved["result"], replay["result"]);
+    let resolved = post(
+        s.token("model"),
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":5,
+        "method":"tools/call","params":{"name":"memory.reconcile_effect",
+        "arguments":{"idempotencyKey":key}}}),
+    )
+    .json::<Value>()
+    .unwrap();
+    assert_eq!(
+        resolved["result"]["structuredContent"]["status"],
+        "confirmed"
+    );
+    assert_eq!(
+        resolved["result"]["structuredContent"]["value"],
+        saved["result"]
+    );
     assert_eq!(
         http.delete(&s.url)
             .bearer_auth(s.token("model"))
@@ -307,7 +353,7 @@ fn stdio_is_a_native_rust_relay() {
         let r = decode(line.as_bytes()).unwrap();
         assert_eq!(r["id"], id);
         if id == 2 {
-            assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 6)
+            assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7)
         }
     }
     drop(input);

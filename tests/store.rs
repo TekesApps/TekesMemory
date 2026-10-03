@@ -1,5 +1,9 @@
 use serde_json::{Value, json};
-use tekes_memory::{common::*, config::SCHEMAS, store::Store};
+use tekes_memory::{
+    common::*,
+    config::{SCHEMAS, tools_for},
+    store::Store,
+};
 fn scope() -> Value {
     json!({"kind":"workspace","owner_id":"u","workspace_id":"ws"})
 }
@@ -84,6 +88,62 @@ fn restart_and_exact_retry() {
     let mut changed = a;
     changed["content"] = json!("different");
     f.error("idempotency_conflict", "save", changed)
+}
+#[test]
+fn kernel_effect_receipt_is_atomic_replayable_and_scope_bound() {
+    let f = Fixture::new();
+    let p = principal("model");
+    let key = "a".repeat(64);
+    let args = save("business-key");
+    let tools = tools_for(&p);
+    let listed = tools.as_array().unwrap();
+    let save_tool = listed
+        .iter()
+        .find(|tool| tool["name"] == "memory.save")
+        .unwrap();
+    assert_eq!(
+        save_tool["_meta"]["io.tekes/externalEffect"]["reconcileTool"],
+        "memory.reconcile_effect"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|tool| tool["name"] == "memory.reconcile_effect"
+                && tool["annotations"]["readOnlyHint"] == true)
+    );
+    assert_eq!(
+        f.store.reconcile_effect(&p, &key).unwrap()["status"],
+        "not_found"
+    );
+    let result = f
+        .store
+        .call_with_effect(&p, "memory.save", &args, Some(&key))
+        .unwrap();
+    let receipt = f.store.reconcile_effect(&p, &key).unwrap();
+    assert_eq!(receipt["status"], "confirmed");
+    assert_eq!(receipt["value"]["structuredContent"], result);
+    let reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    assert_eq!(
+        reopened
+            .call_with_effect(&p, "memory.save", &args, Some(&key))
+            .unwrap(),
+        result
+    );
+    let mut changed = args.clone();
+    changed["content"] = json!("different");
+    assert_eq!(
+        reopened
+            .call_with_effect(&p, "memory.save", &changed, Some(&key))
+            .unwrap_err()
+            .0,
+        "idempotency_conflict"
+    );
+    let mut other = p.clone();
+    other["id"] = json!("other");
+    assert_eq!(
+        reopened.reconcile_effect(&other, &key).unwrap()["status"],
+        "not_found"
+    );
 }
 #[test]
 fn scope_and_operation_isolation() {
@@ -480,7 +540,7 @@ fn rust_schema_assets_are_closed() {
     }
     assert_eq!(
         SCHEMAS.keys().filter(|n| n.starts_with("memory.")).count(),
-        7
+        8
     )
 }
 
