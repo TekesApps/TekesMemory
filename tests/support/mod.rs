@@ -47,7 +47,7 @@ impl Service {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        for _ in 0..200 {
+        for _ in 0..1000 {
             if ready.exists() {
                 let r: Value = serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
                 return (child, r["endpoint"].as_str().unwrap().into());
@@ -61,7 +61,14 @@ impl Service {
         }
         child.kill().unwrap();
         child.wait().unwrap();
-        panic!("service startup timed out")
+        let mut error = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut error)
+            .unwrap();
+        panic!("service startup timed out: {error}")
     }
     pub fn update_adapter(&mut self) {
         let path = self.adapter_path();

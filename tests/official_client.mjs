@@ -16,7 +16,8 @@ const transport = process.env.TEKES_MEMORY_STDIO_BIN
 try {
   await client.connect(transport);
   const {tools} = await client.listTools();
-  assert.equal(tools.length, 6);
+  assert.equal(tools.length, 7);
+  assert(tools.some(t => t.name === 'memory.reconcile_effect'));
   assert(!tools.some(t => t.name === 'memory.observe'));
   const scope = {kind: 'workspace', owner_id: owner, workspace_id: 'ws'};
   const saved = await client.callTool({name: 'memory.save', arguments: {schema_version: 1, scope,

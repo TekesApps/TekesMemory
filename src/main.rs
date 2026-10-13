@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
-    io::{BufRead, Read, Write},
+    io::{Read, Write},
     path::PathBuf,
     time::Duration,
 };
@@ -168,45 +168,13 @@ fn run(a: Args) -> Result<()> {
             credential_file,
         } => {
             let token = private_json(&credential_file)?;
-            let mut client = None;
-            let mut input = std::io::stdin().lock();
-            loop {
-                let mut line = vec![];
-                input
-                    .by_ref()
-                    .take(MAX_BODY as u64 + 1)
-                    .read_until(b'\n', &mut line)?;
-                if line.is_empty() {
-                    break;
-                }
-                if !line.ends_with(b"\n") {
-                    return Err(err("invalid_argument"));
-                }
-                let request = decode(&line)?;
-                let method = text(&request, "method")?;
-                // Use one HTTP session for the stdio connection; it is never a second DB owner.
-                if method == "initialize" {
-                    if client.is_some() {
-                        return Err(err("invalid_argument"));
-                    }
-                    client = Some(Client::open(
-                        &endpoint,
-                        text(&token, "token")?,
-                        Duration::from_secs(5),
-                    )?);
-                    print(
-                        &json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":PROTOCOL,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"TekesMemory","version":env!("CARGO_PKG_VERSION")}}}),
-                    )?;
-                } else if method != "notifications/initialized" {
-                    let c = client.as_mut().ok_or_else(|| err("invalid_argument"))?;
-                    c.reset_deadline(Duration::from_secs(5));
-                    let response = c.raw(request.clone())?;
-                    if request.get("id").is_some() {
-                        print(&response)?
-                    }
-                }
-            }
-            Ok(())
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(tekes_memory::client::stdio(
+                    &endpoint,
+                    text(&token, "token")?,
+                ))
         }
     }
 }
