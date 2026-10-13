@@ -4,9 +4,11 @@
 
 ## 协议与身份
 
-MCP 兼容基线为 `2025-11-25`。HTTP `/mcp` 返回 JSON，GET 返回 405（不提供主动 SSE）；支持 DELETE 结束会话。所有请求校验 Host、Origin 和 Bearer，握手后的会话绑定当前 principal。配置中的 role、tools 和 scopes 是服务授权依据，调用参数不能扩权。
+协议由精确锁定的官方 `rmcp 3.5.1` 实现，服务仅开放 `2025-11-25`。HTTP `/mcp` 返回 JSON，GET 返回 405（不提供主动 SSE）；支持 DELETE 结束会话。所有请求校验 Host、Origin 和 Bearer，握手后的会话绑定当前 principal。配置中的 role、tools 和 scopes 是服务授权依据，调用参数不能扩权。
 
-`memory.observe` 仅 adapter 可见且可调用；默认 model 可使用另六个工具。工具 inputSchema 与 [schemas](../schemas/) 一致，拒绝未知字段。返回 `structuredContent` 和兼容文本，业务失败为 isError 和结构化 code。没有实现 OAuth 发现流程，凭据通过本机私有配置部署；这不宣称远程 OAuth MCP 服务兼容。
+`memory.observe` 仅 adapter 可见且可调用；默认 model 可使用另六个业务工具及 `memory.reconcile_effect`；后者对具备任一写工具权限的 principal 可见。工具 inputSchema 与 [schemas](../schemas/) 一致，拒绝未知字段。返回 `structuredContent` 和兼容文本，业务失败为 isError 和结构化 code。没有实现 OAuth 发现流程，凭据通过本机私有配置部署；这不宣称远程 OAuth MCP 服务兼容。
+
+SDK 有状态传输的单个终结 SSE 响应由薄适配转为既有 JSON 响应；没有 SSE 重连重放或主动通知。HTTP 与 stdio 均兼容旧的空 clientInfo 对象，自动补实现名称/版本；标准客户端应提供真实 name/version。MCP envelope 类型错误由 SDK 拒绝，工具参数对象的业务 schema 错误保留 isError 结果。`memory.reconcile_effect` 现在也完整校验既有 schema，未知字段返回 `invalid_argument`。
 
 传输按 [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) 实现 JSON 响应模式；工具发现和调用遵循 [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)。记忆工具名与字段是本项目定义。
 
@@ -21,6 +23,7 @@ MCP 兼容基线为 `2025-11-25`。HTTP `/mcp` 返回 JSON，GET 返回 405（�
 | forget | 原子隐藏/清除正文、版本、索引、关联 observation 和依赖闭包；保留最小防重放标记 |
 | observe | 原子持久接收与入队，不在 HTTP 请求中做模型工作；同源修订先清除旧派生数据 |
 | status | 仅原 principal 可查询，重新校验其当前 scope 权限 |
+| reconcile_effect | 按 principal + effect key 查询持久写入回执，重新校验当前 scope 权限；未发现回执不等于可以自动重放 |
 
 事实字段 `subject/predicate/value/environment/valid_from/valid_to` 用于区分冲突和适用区间。重叠适用范围、不同值时标为 contested；不按“谁更新得晚”选真值。显式纠正使冲突值一致后解除标记。程序字段包含前置条件、步骤、成功判据、验证环境和失败模式，不执行这些步骤。
 
@@ -29,6 +32,8 @@ MCP 兼容基线为 `2025-11-25`。HTTP `/mcp` 返回 JSON，GET 返回 405（�
 workspace 查询可合并被授权的 user scope；thread 查询可合并被授权的 workspace/user scope。默认 init 只授权一个 workspace，不自动启用跨项目用户记忆。scope 必须完整匹配结构，不支持仅凭路径推测 scope。
 
 ## 幂等与任务
+
+`tools/call._meta["io.tekes/idempotencyKey"]` 是外部 effect key，与业务参数 `idempotency_key` 各有用途。effect receipt 和业务修改在同一 Store 事务提交；返回 `confirmed` 时携带原工具结果，缺失时返回 `not_found`。MCP session/task 不代替业务回执，网络超时或断连不证明写入回滚；客户端不得因此自动重放写操作。
 
 写操作以 principal + scope + idempotency_key 去重，并校验请求 digest。相同键的原返回值保持稳定；查询 get/status 才反映当前状态。相同来源身份、序号、类型和 digest 的重复交付不生成新 observation；相同源 digest 携带不同正文被拒绝。
 

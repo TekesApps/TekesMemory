@@ -224,7 +224,7 @@ fn direct_mcp_session_lifecycle_and_cross_principal_reject() {
     let r = post(
         s.token("model"),
         None,
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{}}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}}),
     );
     assert_eq!(r.status(), 200);
     let session = r.headers()["MCP-Session-Id"].to_str().unwrap().to_owned();
@@ -337,7 +337,7 @@ fn stdio_is_a_native_rust_relay() {
         (
             1,
             "initialize",
-            json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{}}),
+            json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}),
         ),
         (2, "tools/list", json!({})),
     ] {
@@ -352,6 +352,15 @@ fn stdio_is_a_native_rust_relay() {
         output.read_line(&mut line).unwrap();
         let r = decode(line.as_bytes()).unwrap();
         assert_eq!(r["id"], id);
+        if id == 1 {
+            writeln!(
+                input,
+                "{}",
+                canonical(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+            )
+            .unwrap();
+            input.flush().unwrap();
+        }
         if id == 2 {
             assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7)
         }

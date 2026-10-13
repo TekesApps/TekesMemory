@@ -3,7 +3,7 @@
 > 实现前的设计基线。当前交付状态与实际配置请看 [项目入口](../../README.md) 和 [运行契约](../contracts.md)。
 [总览](README.md) · [接口](interfaces.md) · [宿主接入](integration.md)
 
-状态：后续实施计划。本次交付为设计文档，不把 Kernel hooks 回归结果计为 Memory 服务通过。
+此页保留最初的分阶段设计。当前协议层迁移见 [rmcp 实施与验收](rmcp-migration.md)，当前服务合同见 [运行契约](../contracts.md)；历史计划不代表当前实现状态。
 
 ## 分阶段交付
 

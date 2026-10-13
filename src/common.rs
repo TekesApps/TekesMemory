@@ -340,3 +340,16 @@ pub fn scrub(v: &Value) -> Value {
         _ => v.clone(),
     }
 }
+
+// Compatibility for local clients which historically omitted implementation identity.
+pub(crate) fn normalize_initialize(request: &mut Value) {
+    if request["method"] == "initialize"
+        && let Some(info) = request
+            .pointer_mut("/params/clientInfo")
+            .and_then(Value::as_object_mut)
+    {
+        info.entry("name")
+            .or_insert(serde_json::json!("tekes-memory-client"));
+        info.entry("version").or_insert(serde_json::json!("0"));
+    }
+}

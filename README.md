@@ -30,7 +30,7 @@ Playbook 中引用的节省 token / 提升准确率等数字未在本项目复�
 
 ## 能力
 
-- 7 个 MCP 工具：`memory.search/get/save/correct/forget/observe/status`。
+- 7 个业务工具：`memory.search/get/save/correct/forget/observe/status`，另有按写权限展示的 `memory.reconcile_effect`。
 - Loopback Streamable HTTP MCP、可选原生 stdio relay。
 - bundled SQLite + FTS5，中文双字/英文词法检索、作用域隔离、版本修正、冲突、TTL 和来源失效。
 - observation 与后台任务同事务落盘；幂等重放、删除防复活、重启恢复。
@@ -46,8 +46,8 @@ macOS / Linux，Rust **1.95.0**（rust-toolchain.toml 固定），需要 C 编�
 ```sh
 cargo build --release --locked
 cargo test --locked
-cargo install --path . --locked --root /absolute/tekesmemory-v0.2.0
-/absolute/tekesmemory-v0.2.0/bin/tekes-memory --help
+cargo install --path . --locked --root /absolute/tekesmemory-v0.2.1
+/absolute/tekesmemory-v0.2.1/bin/tekes-memory --help
 ```
 
 Cargo.lock 固定依赖；生成 hook 前应先把二进制安装到固定版本目录。不要让生产 hook 指向会被开发构建覆盖的 target/debug。
@@ -90,6 +90,7 @@ init 输出的 `hook_templates` 中有五个 canonical JSON 文件，安装到�
 
 ## 文档
 
+- [rmcp 迁移实施与验收](docs/design/rmcp-migration.md)
 - [运行契约](docs/contracts.md)
 - [安装、配置、升级与运维](docs/operations.md)
 - [Rust 验证与复现](docs/verification.md)
