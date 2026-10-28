@@ -466,7 +466,7 @@ fn stdio_is_a_native_rust_relay() {
     let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
     for (id, method, params) in [
         (
-            1,
+            9_223_372_036_854_775_807_i64,
             "initialize",
             json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}),
         ),
@@ -483,7 +483,7 @@ fn stdio_is_a_native_rust_relay() {
         output.read_line(&mut line).unwrap();
         let r = decode(line.as_bytes()).unwrap();
         assert_eq!(r["id"], id);
-        if id == 1 {
+        if method == "initialize" {
             writeln!(
                 input,
                 "{}",

@@ -280,7 +280,7 @@ impl<'a> Wire<'a> {
             .unwrap();
         let init = http.post(&service.url).bearer_auth(service.token("model"))
             .header("Accept", "application/json, text/event-stream")
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            .json(&json!({"jsonrpc":"2.0","id":9007199254740993_i64,"method":"initialize","params":{
                 "protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"contract","version":"1"}}}))
             .send().unwrap();
         assert_eq!(init.status(), 200);
@@ -294,10 +294,9 @@ impl<'a> Wire<'a> {
             .to_str()
             .unwrap()
             .to_owned();
-        assert_eq!(
-            init.json::<Value>().unwrap()["result"]["protocolVersion"],
-            PROTOCOL
-        );
+        let initialized = init.json::<Value>().unwrap();
+        assert_eq!(initialized["id"], 9007199254740993_i64);
+        assert_eq!(initialized["result"]["protocolVersion"], PROTOCOL);
         let wire = Self {
             service,
             http,
