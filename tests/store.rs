@@ -746,6 +746,67 @@ fn invalidation_cancels_pending_explicit_dependents() {
     while f.store.maintain().unwrap() {}
     assert_eq!(f.call("search", search())["items"], json!([]));
 }
+fn dependent_observation(key: &str, seq: u64, dependency: &Value) -> Value {
+    let mut child = observe(key);
+    child["source_event"]["source_seq"] = json!(seq);
+    child["source_event"]["source_digest"] = json!(format!("{:064x}", seq));
+    child["observation"]["payload"]["summary"] = json!(format!("DEPENDENT_{key}"));
+    child["observation"]["payload"]["lineage_keys"] = json!([dependency]);
+    child
+}
+#[test]
+fn source_invalidation_cancels_transitive_pending_lineage_keys() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("chain-a"));
+    f.store.maintain().unwrap();
+    let b = dependent_observation("chain-b", 10, &a["source_key"]);
+    let b_key = f.call("observe", b)["source_key"].clone();
+    let c = dependent_observation("chain-c", 11, &b_key);
+    let c_key = f.call("observe", c.clone())["source_key"].clone();
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&a["source_key"]));
+    assert!(!f.store.maintain().unwrap());
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_chain-b"));
+    assert!(!content.contains("DEPENDENT_chain-c"));
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), c_key.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_ok()
+    );
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    let mut replay = c;
+    replay["idempotency_key"] = json!("chain-c-replay-new-operation");
+    assert_eq!(
+        reopened
+            .call(&principal("adapter"), "memory.observe", &replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    assert!(!reopened.maintain().unwrap());
+}
+#[test]
+fn forgetting_source_cancels_transitive_pending_lineage_keys() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("chain-a"));
+    f.store.maintain().unwrap();
+    let a_record = f.call("search", search())["items"][0].clone();
+    let b = dependent_observation("chain-b", 10, &a["source_key"]);
+    let b_key = f.call("observe", b)["source_key"].clone();
+    let c = dependent_observation("chain-c", 11, &b_key);
+    f.call("observe", c);
+    f.call("forget", f.forget(&a_record["id"], 1));
+    assert!(!f.store.maintain().unwrap());
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_chain-b"));
+    assert!(!content.contains("DEPENDENT_chain-c"));
+}
 #[test]
 fn source_key_invalidation_is_scope_bound() {
     let f = Fixture::new();
@@ -773,7 +834,7 @@ fn source_key_invalidation_is_scope_bound() {
     );
 }
 #[test]
-fn legacy_explicit_edges_recover_but_implicit_aggregate_edges_do_not() {
+fn explicit_edges_work_after_restart_but_implicit_aggregate_edges_are_not_guessed() {
     let f = Fixture::new();
     let a = f.call("observe", observe("legacy-source-a"));
     f.store.maintain().unwrap();

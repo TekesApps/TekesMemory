@@ -626,26 +626,44 @@ impl Store {
         self.db.execute("UPDATE jobs SET state='completed' WHERE id IN (SELECT id FROM observations WHERE scope=? AND source_key=?)",params![scope,key])?;
         Ok(())
     }
-    fn clear_pending_dependents(&self, scope: &str, key: &str) -> Result<()> {
-        let rows = self.db.prepare(
-            "SELECT o.id,o.payload FROM observations o JOIN jobs j ON j.id=o.id WHERE o.scope=? AND j.state IN ('accepted','failed')"
-        )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (id, payload) in rows {
-            let payload: Value = serde_json::from_str(&payload)?;
-            if payload["payload"]["sources"]
-                .as_array()
-                .is_some_and(|sources| sources.iter().any(|source| source["source_key"] == key))
-            {
-                self.db.execute(
-                    "UPDATE observations SET payload='{}',state='deleted' WHERE id=?",
-                    [&id],
-                )?;
-                self.db
-                    .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+    fn clear_pending_dependents(&self, scope: &str, key: &str) -> Result<Vec<String>> {
+        let mut queue = vec![key.to_owned()];
+        let mut seen = BTreeSet::new();
+        while let Some(key) = queue.pop() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let rows = self.db.prepare(
+                "SELECT o.id,o.source_key,o.payload FROM observations o JOIN jobs j ON j.id=o.id WHERE o.scope=? AND j.state IN ('accepted','failed')"
+            )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (id, own_key, payload) in rows {
+                let payload: Value = serde_json::from_str(&payload)?;
+                let depends_on_key =
+                    payload["payload"]["sources"]
+                        .as_array()
+                        .is_some_and(|sources| {
+                            sources.iter().any(|source| source["source_key"] == key)
+                        })
+                        || payload["payload"]["lineage_keys"]
+                            .as_array()
+                            .is_some_and(|keys| keys.iter().any(|source_key| source_key == &key));
+                if depends_on_key {
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                        params![scope, own_key],
+                    )?;
+                    self.db.execute(
+                        "UPDATE observations SET payload='{}',state='deleted' WHERE id=?",
+                        [&id],
+                    )?;
+                    self.db
+                        .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+                    queue.push(own_key);
+                }
             }
         }
-        Ok(())
+        Ok(seen.into_iter().collect())
     }
     fn erase(&self, scope: &str, ids: Vec<String>, block: bool) -> Result<usize> {
         let mut queue = ids;
@@ -676,7 +694,10 @@ impl Store {
                         params![scope, key],
                     )?;
                 }
-                self.clear_pending_dependents(scope, &key)?;
+                let invalidated = self.clear_pending_dependents(scope, &key)?;
+                for invalidated_key in invalidated {
+                    queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![invalidated_key,scope])?);
+                }
                 queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![key,scope])?);
                 self.clear_source(scope, &key, "deleted")?;
             }
@@ -805,8 +826,11 @@ impl Store {
                     "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
                     params![scope, target],
                 )?;
-                self.clear_pending_dependents(&scope, target)?;
-                let ids=self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,target])?;
+                let invalidated = self.clear_pending_dependents(&scope, target)?;
+                let mut ids = Vec::new();
+                for invalidated_key in invalidated {
+                    ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+                }
                 self.erase(&scope, ids, true)?;
                 self.clear_source(&scope, target, "deleted")?;
             }
@@ -919,6 +943,10 @@ impl Store {
                     .as_object_mut()
                     .ok_or_else(|| err("invalid_argument"))?
                     .remove("sources");
+                summary
+                    .as_object_mut()
+                    .ok_or_else(|| err("invalid_argument"))?
+                    .remove("lineage_keys");
                 summary["observation"] = obs["type"].clone();
                 let content = canonical(&summary).chars().take(32768).collect::<String>();
                 let saved=self.save(&json!({"scope":serde_json::from_str::<Value>(&scope)?,"kind":"episode","content":content,"sources":sources}))?;
