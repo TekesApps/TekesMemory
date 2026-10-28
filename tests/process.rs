@@ -94,7 +94,7 @@ fn default_adapter_retrieves_long_multibyte_summary_within_wrapped_budget() {
     let s = Service::new();
     let adapter = s.adapter_path();
     let mut config = private_json(&adapter).unwrap();
-    config["retrieval"]["max_utf8_bytes"] = json!(8192);
+    config["retrieval"]["max_utf8_bytes"] = json!(12000);
     config["retrieval"]["estimated_tokens"] = json!(8192);
     std::fs::write(&adapter, canonical(&config)).unwrap();
 
@@ -154,6 +154,27 @@ fn default_adapter_retrieves_long_multibyte_summary_within_wrapped_budget() {
         context.len() <= 8192,
         "wrapped context was {} bytes",
         context.len()
+    );
+
+    // The schema minima leave no room for wrapper reservation. The clamped
+    // request must still validate and safely omit a hit that cannot fit.
+    config["retrieval"]["max_utf8_bytes"] = json!(256);
+    config["retrieval"]["estimated_tokens"] = json!(64);
+    std::fs::write(&adapter, canonical(&config)).unwrap();
+    let tiny = s.hook(
+        "context.prepare",
+        json!({"items":[{"role":"user","content":"ADAPTERLONGMARKER"}]}),
+        &path,
+    );
+    assert!(
+        tiny.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tiny.stderr)
+    );
+    assert!(
+        decode(&tiny.stdout).unwrap()["context"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
     );
 }
 #[test]

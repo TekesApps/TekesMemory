@@ -255,6 +255,33 @@ fn search_skips_metadata_that_cannot_fit_and_continues_to_later_hits() {
     assert!(result["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
 }
 #[test]
+fn search_defers_hit_that_only_fits_on_a_fresh_page() {
+    let f = Fixture::new();
+    for key in ["long-page-one", "long-page-two"] {
+        let mut a = save(key);
+        a["content"] = json!(format!("findme {}", "🙂".repeat(3000)));
+        f.call("save", a);
+    }
+    let mut q = search();
+    q["query"] = json!("findme");
+    q["budget"]["max_utf8_bytes"] = json!(8192);
+    q["budget"]["estimated_tokens"] = json!(8192);
+    let first = f.call("search", q.clone());
+    assert_eq!(first["items"].as_array().unwrap().len(), 1, "{first}");
+    assert!(first["items"][0]["content_truncated"].as_bool().unwrap());
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("deferred result cursor");
+    assert!(first["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
+
+    q["cursor"] = json!(cursor);
+    let second = f.call("search", q.clone());
+    assert_eq!(second["items"].as_array().unwrap().len(), 1);
+    assert_ne!(second["items"][0]["id"], first["items"][0]["id"]);
+    assert!(second["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
+    assert!(second["next_cursor"].is_null());
+}
+#[test]
 fn kernel_effect_receipt_is_atomic_replayable_and_scope_bound() {
     let f = Fixture::new();
     let p = principal("model");

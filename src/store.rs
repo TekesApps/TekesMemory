@@ -997,7 +997,17 @@ impl Store {
             let contested = r["status"] == "contested";
             let used = canonical(&json!({"items":items,"conflicts":conflicts})).len();
             let remaining_record_bytes = cap.saturating_sub(used.saturating_add(1));
-            let Some(r) = Self::search_hit(r, text(a, "query")?, remaining_record_bytes) else {
+            let Some(r) = Self::search_hit(r.clone(), text(a, "query")?, remaining_record_bytes)
+            else {
+                let empty_reference_bytes = canonical(&json!({"items":[],"conflicts":[]})).len();
+                let fresh_page_record_bytes =
+                    cap.saturating_sub(empty_reference_bytes.saturating_add(1));
+                if Self::search_hit(r.clone(), text(a, "query")?, fresh_page_record_bytes).is_some()
+                {
+                    // This result fits on a new page; leave it unconsumed so the
+                    // signed cursor resumes at this row instead of losing it.
+                    break;
+                }
                 omitted_for_budget = true;
                 consumed += 1;
                 continue;

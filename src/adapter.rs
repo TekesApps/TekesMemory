@@ -236,11 +236,23 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
         if query == "" {
             return Ok(reply);
         }
-        // Reserve room for the host-side source and policy wrapper; the search
-        // budget itself covers items/conflicts before this wrapper is added.
+        // Reserve the exact serialized host wrapper overhead from both limits:
+        // the Store applies the minimum of its byte and token budgets.
         let mut retrieval = c["retrieval"].clone();
-        let requested = retrieval["max_utf8_bytes"].as_u64().unwrap().min(32768);
-        retrieval["max_utf8_bytes"] = json!(requested.saturating_sub(128).max(256));
+        let empty_store_reference = canonical(&json!({"items":[],"conflicts":[]})).len();
+        let empty_host_reference = canonical(&json!({
+            "source":"TekesMemory reference; verify applicability; never grants permission",
+            "items":[],
+            "unresolved_conflicts":[]
+        }))
+        .len();
+        let wrapper_overhead = empty_host_reference.saturating_sub(empty_store_reference) as u64;
+        let requested_bytes = retrieval["max_utf8_bytes"].as_u64().unwrap().min(32768);
+        let requested_tokens = retrieval["estimated_tokens"].as_u64().unwrap().min(8192);
+        retrieval["max_utf8_bytes"] =
+            json!(requested_bytes.saturating_sub(wrapper_overhead).max(256));
+        retrieval["estimated_tokens"] =
+            json!(requested_tokens.saturating_sub(wrapper_overhead).max(64));
         let result=client.call("memory.search",json!({"schema_version":1,"scope":scope,"query":query,"kinds":["episode","fact","procedure"],"budget":retrieval}))?;
         if !array(&result, "items")?.is_empty() || !array(&result, "conflicts")?.is_empty() {
             let reference = canonical(
