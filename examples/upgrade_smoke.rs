@@ -436,7 +436,7 @@ fn main() {
     stage("old record ID, revision, content, and legacy tail-token search verified");
 
     let ledger = threads.join("upgrade-thread.jsonl");
-    let rows = vec![
+    let rows = [
         json!({"kind":"genesis","seq":1,"workspace":"upgrade-ws","thread":"upgrade-thread"}),
         json!({"kind":"input","seq":2,"content":[{"type":"text","text":"Upgrade lifecycle input"}]}),
         json!({"kind":"turn_open","seq":3,"turn":1,"trigger":{"inputs":[2]}}),
