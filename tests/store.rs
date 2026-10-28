@@ -170,6 +170,130 @@ fn scope_and_operation_isolation() {
     f.error("scope_denied", "search", s)
 }
 #[test]
+fn write_scrubbing_preserves_authorized_identity_and_redacts_content() {
+    let f = Fixture::new();
+    let mut args = save("scope-repro-save");
+    args["scope"] = json!({
+        "kind":"thread",
+        "owner_id":"sk-1234567890123456",
+        "workspace_id":"ghp_0123456789abcdef0123456789",
+        "thread_id":"sk-threadidentifier123456"
+    });
+    args["content"] = json!("Bearer abcdefghijklmnop password=hunter2");
+    args["sources"][0]["ref"] = json!("fixture#sk-1234567890123456");
+    let mut owner = principal("model");
+    owner["owner_id"] = args["scope"]["owner_id"].clone();
+    owner["scopes"] = json!([args["scope"]]);
+    let saved = f.store.call(&owner, "memory.save", &args).unwrap();
+
+    let mut read = f.get(&saved["id"]);
+    read["scope"] = args["scope"].clone();
+    let item = f.store.call(&owner, "memory.get", &read).unwrap()["item"].clone();
+    assert_eq!(item["scope"], args["scope"]);
+    assert_eq!(item["sources"][0]["ref"], args["sources"][0]["ref"]);
+    assert!(
+        item["content"]
+            .as_str()
+            .unwrap()
+            .contains("Bearer [REDACTED]")
+    );
+    assert!(!item["content"].as_str().unwrap().contains("hunter2"));
+
+    let mut other = principal("model");
+    other["owner_id"] = args["scope"]["owner_id"].clone();
+    other["scopes"] = json!([{"kind":"thread","owner_id":args["scope"]["owner_id"],"workspace_id":"[REDACTED]","thread_id":"[REDACTED]"}]);
+    let mut other_read = f.get(&saved["id"]);
+    other_read["scope"] = other["scopes"][0].clone();
+    assert_eq!(
+        f.store
+            .call(&other, "memory.get", &other_read)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+}
+
+#[test]
+fn observation_source_identity_survives_redaction_patterns() {
+    let f = Fixture::new();
+    let mut args = observe("sk-1234567890123456");
+    args["scope"] = json!({"kind":"thread","owner_id":"u","workspace_id":"sk-1234567890123456","thread_id":"ghp_0123456789abcdef0123456789"});
+    args["source_event"]["workspace_id"] = json!("sk-1234567890123456");
+    args["source_event"]["thread_id"] = json!("ghp_0123456789abcdef0123456789");
+    args["source_event"]["event_id"] = json!("Bearer eventidentity0123456789");
+    args["observation"]["type"] = json!("source_invalidated");
+    args["observation"]["payload"]["source_keys"] =
+        json!(["sk-123456789012345678901234567890123456789012345678901234567890"]);
+    args["observation"]["payload"]["summary"] = json!("Bearer abcdefghijklmnop");
+    let mut p = principal("adapter");
+    p["scopes"] = json!([args["scope"]]);
+    let accepted = f.store.call(&p, "memory.observe", &args).unwrap();
+    assert_eq!(accepted["accepted"], true);
+    let payload: String = f
+        .store
+        .db
+        .query_row(
+            "SELECT payload FROM observations WHERE id=?",
+            [accepted["observation_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        stored["payload"]["source_keys"],
+        args["observation"]["payload"]["source_keys"]
+    );
+    assert!(
+        stored["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Bearer [REDACTED]")
+    );
+    assert!(!f.store.maintain().unwrap());
+}
+
+#[test]
+fn known_other_scope_record_cannot_be_corrected_or_forgotten() {
+    let f = Fixture::new();
+    let mut other_scope = scope();
+    other_scope["workspace_id"] = json!("[REDACTED]");
+    let mut other = principal("model");
+    other["scopes"] = json!([other_scope]);
+    let mut other_save = save("other-save");
+    other_save["scope"] = other_scope.clone();
+    let other_record = f.store.call(&other, "memory.save", &other_save).unwrap();
+
+    let mut authorized_scope = scope();
+    authorized_scope["workspace_id"] = json!("sk-1234567890123456");
+    let mut owner = principal("model");
+    owner["scopes"] = json!([authorized_scope.clone()]);
+    let mut correct = f.correct(&other_record["id"]);
+    correct["scope"] = authorized_scope.clone();
+    assert_eq!(
+        f.store
+            .call(&owner, "memory.correct", &correct)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+    let mut forget = f.forget(&other_record["id"], 1);
+    forget["scope"] = authorized_scope;
+    assert_eq!(
+        f.store
+            .call(&owner, "memory.forget", &forget)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+
+    let mut other_read = f.get(&other_record["id"]);
+    other_read["scope"] = other_scope;
+    assert_eq!(
+        f.store.call(&other, "memory.get", &other_read).unwrap()["item"]["content"],
+        other_save["content"]
+    );
+}
+#[test]
 fn model_cannot_forge_observation() {
     let f = Fixture::new();
     let mut p = principal("adapter");

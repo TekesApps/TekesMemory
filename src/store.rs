@@ -20,6 +20,30 @@ fn valid_effect_key(key: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
+fn scrub_write_args(name: &str, args: &Value) -> Value {
+    let mut safe = args.clone();
+    // Scope, source references, event IDs, and idempotency inputs are identities; redact only
+    // fields that carry user-authored memory text so those identities remain exact.
+    let fields: &[&str] = match name {
+        "memory.save" => &["content", "fact", "procedure"],
+        "memory.correct" => &["replacement", "fact", "procedure"],
+        "memory.observe" => &[],
+        _ => &[],
+    };
+    for field in fields {
+        if let Some(value) = args.get(*field) {
+            safe[*field] = scrub(value);
+        }
+    }
+    if name == "memory.observe" {
+        for field in ["summary", "reason"] {
+            if let Some(value) = args.pointer(&format!("/observation/payload/{field}")) {
+                safe["observation"]["payload"][field] = scrub(value);
+            }
+        }
+    }
+    safe
+}
 pub fn words(s: &str) -> Vec<String> {
     use std::sync::LazyLock;
     static WORD: LazyLock<regex::Regex> =
@@ -213,7 +237,7 @@ impl Store {
                 }
                 serde_json::from_str(&result)?
             } else {
-                let safe = scrub(a);
+                let safe = scrub_write_args(name, a);
                 let mut r = match name {
                     "memory.save" => self.save(&safe)?,
                     "memory.correct" => self.correct(&safe)?,
