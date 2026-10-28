@@ -1,0 +1,34 @@
+tests.log:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.60s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.17s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.30s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+sdk.log:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+official SDK stdio initialize/list/save/get/search/close: passed
+official SDK HTTP initialize/list/save/get/search/close: passed
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.45s
+installed-sdk.log:
+official SDK HTTP initialize/list/save/get/search/close: passed
+official SDK stdio initialize/list/save/get/search/close: passed
+clippy.log:
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.15s
+installed-deployment.log:
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.06s
+{"empty_environment":true,"http_save":true,"init":true,"installed_binary":"/tmp/tekesmemory-release-v0.2.2/install-0.2.2/bin/tekes-memory","kernel_hook":true,"launchd_plist":true,"outside_source_directory":true}
+upgrade-final.log:
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.99s
+stage: installed versions verified
+stage: v0.2.1 wrote durable record and stopped cleanly
+stage: config and data backed up with file modes preserved
+stage: v0.2.2 took over the same config, data, credentials, and identities
+stage: old record ID, revision, content, and legacy tail-token search verified
+stage: installed v0.2.2 adapter accepted tool.completed seq 5 and turn.settled seq 7
+stage: forget removed the actual tool result and dependent settled record
+stage: forget closure and legacy record verified after service restart

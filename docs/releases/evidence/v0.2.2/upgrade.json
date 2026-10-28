@@ -1,0 +1,15 @@
+{
+  "backup_modes_preserved": true,
+  "credential_hashes_unchanged": true,
+  "five_hooks_use_new_binary": true,
+  "fixture_root": "/tmp/tekesmemory-release-v0.2.2/final-upgrade-evidence/tekesmemory-upgrade-d6878d51bf86410596aa3d92c1fdc060",
+  "forget_survives_restart": true,
+  "forget_tool_result_deleted_dependent_turn": true,
+  "legacy_tail_token_reindexed": true,
+  "new_version": "0.2.2",
+  "old_record_preserved": true,
+  "old_version": "0.2.1",
+  "scope_and_host_instance_unchanged": true,
+  "tool_completed_seq": 5,
+  "turn_settled_seq": 7
+}

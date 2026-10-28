@@ -1,4 +1,4 @@
-# 当前运行契约（Rust 0.2.0）
+# 当前运行契约（Rust 0.2.2）
 
 [项目入口](../README.md) · [运维](operations.md) · [验证](verification.md)
 
