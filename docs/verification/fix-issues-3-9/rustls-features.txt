@@ -1,0 +1,117 @@
+    Blocking waiting for file lock on package cache
+rustls v0.23.46
+└── hyper-rustls v0.27.9
+    ├── hyper-rustls feature "aws-lc-rs"
+    │   └── reqwest feature "__rustls-aws-lc-rs"
+    │       └── reqwest feature "rustls"
+    │           └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory)
+    │               └── tekes-memory feature "default" (command-line)
+    ├── hyper-rustls feature "http1"
+    │   ├── reqwest v0.12.28
+    │   │   ├── reqwest feature "__rustls"
+    │   │   │   └── reqwest feature "rustls-tls-webpki-roots-no-provider"
+    │   │   │       └── reqwest feature "rustls-tls-webpki-roots"
+    │   │   │           └── reqwest feature "rustls-tls"
+    │   │   │               └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │   │   ├── reqwest feature "__rustls-ring"
+    │   │   │   └── reqwest feature "rustls-tls-webpki-roots" (*)
+    │   │   ├── reqwest feature "__tls"
+    │   │   │   └── reqwest feature "__rustls" (*)
+    │   │   ├── reqwest feature "blocking"
+    │   │   │   └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │   │   ├── reqwest feature "json"
+    │   │   │   └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │   │   ├── reqwest feature "rustls-tls" (*)
+    │   │   ├── reqwest feature "rustls-tls-webpki-roots" (*)
+    │   │   └── reqwest feature "rustls-tls-webpki-roots-no-provider" (*)
+    │   └── reqwest v0.13.5
+    │       ├── reqwest feature "__rustls"
+    │       │   └── reqwest feature "rustls" (*)
+    │       ├── reqwest feature "__rustls-aws-lc-rs" (*)
+    │       ├── reqwest feature "__tls"
+    │       │   └── reqwest feature "__rustls" (*)
+    │       ├── reqwest feature "json"
+    │       │   ├── rmcp v3.5.1
+    │       │   │   ├── rmcp feature "__reqwest"
+    │       │   │   │   └── rmcp feature "transport-streamable-http-client-reqwest"
+    │       │   │   │       └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │       │   │   ├── rmcp feature "base64"
+    │       │   │   │   ├── rmcp feature "client-side-sse"
+    │       │   │   │   │   └── rmcp feature "transport-streamable-http-client"
+    │       │   │   │   │       └── rmcp feature "transport-streamable-http-client-reqwest" (*)
+    │       │   │   │   └── rmcp feature "server-side-http"
+    │       │   │   │       └── rmcp feature "transport-streamable-http-server"
+    │       │   │   │           └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │       │   │   ├── rmcp feature "client"
+    │       │   │   │   └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │       │   │   ├── rmcp feature "client-side-sse" (*)
+    │       │   │   ├── rmcp feature "schemars"
+    │       │   │   │   └── rmcp feature "server"
+    │       │   │   │       └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │       │   │   ├── rmcp feature "server" (*)
+    │       │   │   ├── rmcp feature "server-side-http" (*)
+    │       │   │   ├── rmcp feature "tower"
+    │       │   │   │   └── rmcp feature "server-side-http" (*)
+    │       │   │   ├── rmcp feature "transport-async-rw"
+    │       │   │   │   ├── rmcp feature "server" (*)
+    │       │   │   │   ├── rmcp feature "transport-io"
+    │       │   │   │   │   └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │       │   │   │   └── rmcp feature "transport-streamable-http-server-session"
+    │       │   │   │       └── rmcp feature "transport-streamable-http-server" (*)
+    │       │   │   ├── rmcp feature "transport-io" (*)
+    │       │   │   ├── rmcp feature "transport-streamable-http-client" (*)
+    │       │   │   ├── rmcp feature "transport-streamable-http-client-reqwest" (*)
+    │       │   │   ├── rmcp feature "transport-streamable-http-server" (*)
+    │       │   │   ├── rmcp feature "transport-streamable-http-server-session" (*)
+    │       │   │   ├── rmcp feature "transport-worker"
+    │       │   │   │   ├── rmcp feature "transport-streamable-http-client" (*)
+    │       │   │   │   └── rmcp feature "transport-streamable-http-server" (*)
+    │       │   │   └── rmcp feature "uuid"
+    │       │   │       ├── rmcp feature "server" (*)
+    │       │   │       └── rmcp feature "server-side-http" (*)
+    │       │   └── tekes-memory v0.2.1 (/Users/frankqin/dev/TekesMemory) (*)
+    │       ├── reqwest feature "rustls" (*)
+    │       └── reqwest feature "stream"
+    │           └── rmcp v3.5.1 (*)
+    ├── hyper-rustls feature "ring"
+    │   └── reqwest feature "__rustls-ring" (*)
+    ├── hyper-rustls feature "tls12"
+    │   ├── reqwest v0.12.28 (*)
+    │   └── reqwest v0.13.5 (*)
+    ├── hyper-rustls feature "webpki-roots"
+    │   └── hyper-rustls feature "webpki-tokio"
+    │       └── reqwest feature "rustls-tls-webpki-roots-no-provider" (*)
+    └── hyper-rustls feature "webpki-tokio" (*)
+├── rustls feature "aws-lc-rs"
+│   ├── rustls feature "aws_lc_rs"
+│   │   ├── hyper-rustls feature "aws-lc-rs" (*)
+│   │   └── tokio-rustls feature "aws_lc_rs"
+│   │       └── tokio-rustls feature "aws-lc-rs"
+│   │           └── reqwest feature "__rustls-aws-lc-rs" (*)
+│   └── reqwest feature "__rustls-aws-lc-rs" (*)
+├── rustls feature "aws_lc_rs" (*)
+├── rustls feature "ring"
+│   ├── reqwest feature "__rustls-ring" (*)
+│   ├── hyper-rustls feature "ring" (*)
+│   └── tokio-rustls feature "ring"
+│       └── reqwest feature "__rustls-ring" (*)
+├── rustls feature "std"
+│   ├── reqwest v0.12.28 (*)
+│   ├── reqwest v0.13.5 (*)
+│   ├── rustls-platform-verifier v0.7.1
+│   │   └── rustls-platform-verifier feature "default"
+│   │       └── reqwest v0.13.5 (*)
+│   └── tokio-rustls v0.26.5
+│       └── hyper-rustls v0.27.9 (*)
+│       ├── tokio-rustls feature "aws-lc-rs" (*)
+│       ├── tokio-rustls feature "aws_lc_rs" (*)
+│       ├── tokio-rustls feature "ring" (*)
+│       └── tokio-rustls feature "tls12"
+│           ├── reqwest v0.12.28 (*)
+│           └── reqwest v0.13.5 (*)
+│           └── hyper-rustls feature "tls12" (*)
+└── rustls feature "tls12"
+    ├── reqwest v0.12.28 (*)
+    └── reqwest v0.13.5 (*)
+    ├── hyper-rustls feature "tls12" (*)
+    └── tokio-rustls feature "tls12" (*)

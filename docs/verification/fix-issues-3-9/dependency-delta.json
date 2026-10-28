@@ -1,0 +1,18 @@
+{
+  "removed": [
+    "rustls-webpki@0.103.15",
+    "rustls@0.23.45",
+    "tokio@1.53.1",
+    "webpki-root-certs@1.0.9",
+    "webpki-roots@1.0.9"
+  ],
+  "added": [
+    "rustls-webpki@0.103.16",
+    "rustls@0.23.46",
+    "tokio@1.54.1",
+    "webpki-root-certs@1.0.11",
+    "webpki-roots@1.0.11"
+  ],
+  "package_count_before": 258,
+  "package_count_after": 258
+}

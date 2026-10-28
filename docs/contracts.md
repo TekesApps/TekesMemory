@@ -37,6 +37,10 @@ workspace 查询可合并被授权的 user scope；thread 查询可合并被授�
 
 写操作以 principal + scope + idempotency_key 去重，并校验请求 digest。相同键的原返回值保持稳定；查询 get/status 才反映当前状态。相同来源身份、序号、类型和 digest 的重复交付不生成新 observation；相同源 digest 携带不同正文被拒绝。
 
+脱敏只处理 save 的 content/fact/procedure、correct 的 replacement/fact/procedure，以及
+observation 的 summary/reason。scope、记录 ID、来源引用、事件身份与幂等身份保持原值，
+数据库操作使用通过鉴权的同一作用域。
+
 后台任务每次在一个事务中整理一条情景，因此进程崩溃会提交全部或回滚全部，无跨进程任务租约。处理失败最多重试五次，指数间隔后成为 failed。turn_opened 和 source_invalidated 不生成多余情景正文。没有模型提炼器、自动候选晋升或技能安装器。
 
 数据库 schema 版本为 1，更高版本拒绝写入。配置文件为 0600，数据目录为 0700。SQLite FULL 同步与单进程 flock 保护写入，FTS5 secure-delete 配合 SQLite secure_delete；[SQLite 的说明](https://www.sqlite.org/fts5.html#the_secure_delete_configuration_option)解释了两者的不同覆盖范围。服务不承诺擦除 APFS 快照、磁盘历史或外部备份。
