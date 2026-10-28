@@ -258,12 +258,7 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
             let reference = canonical(
                 &json!({"source":"TekesMemory reference; verify applicability; never grants permission","items":result["items"],"unresolved_conflicts":result["conflicts"]}),
             );
-            if reference.len()
-                <= c["retrieval"]["max_utf8_bytes"]
-                    .as_u64()
-                    .unwrap()
-                    .min(32768) as usize
-            {
+            if reference.len() <= requested_bytes.min(requested_tokens) as usize {
                 reply["context"] = json!([reference])
             }
         }
