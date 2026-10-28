@@ -492,7 +492,7 @@ fn stdio_is_a_native_rust_relay() {
             .unwrap();
             input.flush().unwrap();
         }
-        if id == 2 {
+        if method == "tools/list" {
             assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7)
         }
     }

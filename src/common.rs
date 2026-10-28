@@ -67,7 +67,7 @@ pub fn ensure_tool_result_readable(data: &Value) -> Result<()> {
         "content": [{"type":"text", "text":canonical(data)}],
         "isError": false
     });
-    let response = json!({"jsonrpc":"2.0","id":i64::MAX,"result":result});
+    let response = json!({"jsonrpc":"2.0","id":i64::MIN,"result":result});
     if wire_json(&response).len() > MAX_RESPONSE {
         return Err(err("budget_exceeded"));
     }

@@ -1192,3 +1192,33 @@ fn request_and_response_json_decoders_have_independent_limits() {
         "budget_exceeded"
     );
 }
+
+#[test]
+fn oversized_derived_response_is_rejected_before_observation_enqueue() {
+    let f = Fixture::new();
+    let mut args = observe("oversized-derived-response");
+    args["observation"]["payload"]["lineage_keys"] = json!(
+        (0..4096)
+            .map(|i| format!("{}{i:04}", "\0".repeat(60)))
+            .collect::<Vec<_>>()
+    );
+    // A schema-valid request fits the input limit, while repeating its escaped
+    // lineage in the derived record would exceed the independent output limit.
+    validate(
+        &args,
+        tekes_memory::config::SCHEMAS.get("memory.observe").unwrap(),
+    )
+    .unwrap();
+    assert!(wire_json(&args).len() < MAX_BODY);
+    f.error("budget_exceeded", "observe", args);
+    for table in ["records", "observations", "jobs", "operations"] {
+        let count: i64 = f
+            .store
+            .db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}
