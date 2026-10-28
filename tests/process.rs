@@ -69,6 +69,52 @@ fn real_http_store_restart_and_all_five_kernel_hooks() {
             .map(|r| r["id"].clone())
             .collect::<Vec<_>>(),
         ids
+    );
+    let items = s.search()["items"].as_array().unwrap().clone();
+    let tool = items
+        .iter()
+        .find(|item| {
+            let content = item["content"].as_str().unwrap();
+            content.contains("AUDITLINEAGEMARKER")
+                && content.contains("\"observation\":\"tool_result\"")
+        })
+        .unwrap();
+    let turn = items.iter().find(|item| {
+        let content = item["content"].as_str().unwrap();
+        content.contains("AUDITLINEAGEMARKER")
+            && content.contains("\"observation\":\"turn_outcome\"")
+            && item["id"] != tool["id"]
+    });
+    assert!(turn.is_some(), "settled summary must retain tool output");
+    let result = s
+        .client("model")
+        .call(
+            "memory.forget",
+            json!({
+                "schema_version":1,
+                "scope":s.scope,
+                "ids":[tool["id"]],
+                "expected_revisions":[tool["revision"]],
+                "idempotency_key":"forget-tool-result"
+            }),
+        )
+        .unwrap();
+    assert_eq!(result["hidden"], true);
+    let after_forget = s.search();
+    assert!(
+        !canonical(&after_forget).contains("AUDITLINEAGEMARKER"),
+        "remaining lineage records: {}",
+        canonical(&after_forget)
+    );
+    assert_eq!(
+        s.client("model")
+            .call(
+                "memory.get",
+                json!({"schema_version":1,"scope":s.scope,"id":turn.unwrap()["id"]})
+            )
+            .unwrap_err()
+            .0,
+        "not_found"
     )
 }
 #[test]
@@ -88,6 +134,94 @@ fn adapter_continuation_reads_admitted_task() {
             .unwrap()
             .contains("cargo test")
     )
+}
+#[test]
+fn default_adapter_retrieves_long_multibyte_summary_within_wrapped_budget() {
+    let s = Service::new();
+    let adapter = s.adapter_path();
+    let mut config = private_json(&adapter).unwrap();
+    config["retrieval"]["max_utf8_bytes"] = json!(12000);
+    config["retrieval"]["estimated_tokens"] = json!(8192);
+    std::fs::write(&adapter, canonical(&config)).unwrap();
+
+    let (path, mut rows) = s.ledger();
+    rows[1]["content"] = json!([{"type":"text","text":"ADAPTERLONGMARKER"}]);
+    rows[5]["content"] =
+        json!([{"type":"text","text":format!("ADAPTERLONGMARKER {}", "🙂".repeat(4500))}]);
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|v| format!("{}\n", canonical(v)))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let output = s.hook(
+        "turn.settled",
+        json!({"source_seq":7,"record":rows[6]}),
+        &path,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut indexed = false;
+    for _ in 0..100 {
+        indexed = s.search()["items"].as_array().unwrap().iter().any(|item| {
+            item["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ADAPTERLONGMARKER")
+        });
+        if indexed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(indexed, "long settled summary was not persisted");
+
+    let query = s.hook(
+        "context.prepare",
+        json!({"items":[{"role":"user","content":"ADAPTERLONGMARKER"}]}),
+        &path,
+    );
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let context = decode(&query.stdout).unwrap()["context"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(context.contains("ADAPTERLONGMARKER"));
+    assert!(
+        context.len() <= 8192,
+        "wrapped context was {} bytes",
+        context.len()
+    );
+
+    // The schema minima leave no room for wrapper reservation. The clamped
+    // request must still validate and safely omit a hit that cannot fit.
+    config["retrieval"]["max_utf8_bytes"] = json!(256);
+    config["retrieval"]["estimated_tokens"] = json!(64);
+    std::fs::write(&adapter, canonical(&config)).unwrap();
+    let tiny = s.hook(
+        "context.prepare",
+        json!({"items":[{"role":"user","content":"ADAPTERLONGMARKER"}]}),
+        &path,
+    );
+    assert!(
+        tiny.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tiny.stderr)
+    );
+    assert!(
+        decode(&tiny.stdout).unwrap()["context"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
 }
 #[test]
 fn host_auth_origin_and_media_guards() {
@@ -335,16 +469,16 @@ fn stdio_is_a_native_rust_relay() {
     let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
     for (id, method, params) in [
         (
-            1,
+            9_223_372_036_854_775_807_i64,
             "initialize",
             json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}),
         ),
-        (2, "tools/list", json!({})),
+        (9_007_199_254_740_993_i64, "tools/list", json!({})),
     ] {
         writeln!(
             input,
             "{}",
-            canonical(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            wire_json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         )
         .unwrap();
         input.flush().unwrap();
@@ -352,7 +486,7 @@ fn stdio_is_a_native_rust_relay() {
         output.read_line(&mut line).unwrap();
         let r = decode(line.as_bytes()).unwrap();
         assert_eq!(r["id"], id);
-        if id == 1 {
+        if method == "initialize" {
             writeln!(
                 input,
                 "{}",
@@ -361,12 +495,162 @@ fn stdio_is_a_native_rust_relay() {
             .unwrap();
             input.flush().unwrap();
         }
-        if id == 2 {
+        if method == "tools/list" {
             assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7)
         }
     }
+    for id in [
+        "9007199254740991",
+        "9007199254740992",
+        "9007199254740993",
+        "9223372036854775807",
+        "-9223372036854775808",
+    ] {
+        writeln!(input, r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#).unwrap();
+        input.flush().unwrap();
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert!(line.contains(&format!("\"id\":{id}")), "{line}");
+    }
+    input
+        .write_all(br#"{"jsonrpc":"2.0","id":"stdio-string-id","method":"ping"}"#)
+        .unwrap();
+    input.write_all(b"\n").unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":"stdio-string-id""#), "{line}");
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        )
+        .unwrap();
+    input.write_all(b"\n").unwrap();
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","id":987,"method":"ping"}))
+    )
+    .unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(decode(line.as_bytes()).unwrap()["id"], 987);
     drop(input);
     assert!(child.wait().unwrap().success())
+}
+
+#[test]
+fn stdio_returns_large_valid_saved_record() {
+    let s = Service::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
+        .args(["stdio", "--endpoint", &s.url, "--credential-file"])
+        .arg(s.credential("model"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"large","version":"1"}}}))).unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let initialized = decode(line.as_bytes()).unwrap();
+    assert_eq!(initialized["id"], 1);
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+    )
+    .unwrap();
+    let sources = (0..64)
+        .map(|_| json!({"host":"test","ref":"🙂".repeat(4096),"digest":"a".repeat(64)}))
+        .collect::<Vec<_>>();
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.save","arguments":{"schema_version":1,"scope":s.scope,"kind":"episode","content":"large stdio readback","sources":sources,"idempotency_key":"large-stdio"}}}))).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let saved = decode_response(line.as_bytes()).unwrap();
+    assert_eq!(saved["id"], 2);
+    assert_eq!(saved["result"]["isError"], false);
+    let id = saved["result"]["structuredContent"]["id"].clone();
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.get","arguments":{"schema_version":1,"scope":s.scope,"id":id}}}))).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert!(
+        line.len() > MAX_BODY,
+        "response was only {} bytes",
+        line.len()
+    );
+    let loaded = decode_response(line.as_bytes()).unwrap();
+    assert_eq!(loaded["id"], 3);
+    assert_eq!(
+        loaded["result"]["structuredContent"]["item"]["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn stdio_reports_unsupported_numeric_id_and_continues() {
+    let s = Service::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
+        .args(["stdio", "--endpoint", &s.url, "--credential-file"])
+        .arg(s.credential("model"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        input,
+        r#"{{"jsonrpc":"2.0","id":9223372036854775808,"method":"ping"}}"#
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let error = decode(line.as_bytes()).unwrap();
+    assert_eq!(error["id"], Value::Null);
+    assert_eq!(error["error"]["code"], -32600);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("signed 64-bit")
+    );
+
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"after-invalid-id","version":"1"}}}))).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(decode(line.as_bytes()).unwrap()["id"], 1);
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+    )
+    .unwrap();
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+    )
+    .unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(decode(line.as_bytes()).unwrap()["id"], 2);
+    drop(input);
+    assert!(child.wait().unwrap().success());
 }
 #[test]
 fn unsafe_endpoint_and_redirect_are_not_allowed() {
@@ -378,6 +662,29 @@ fn unsafe_endpoint_and_redirect_are_not_allowed() {
     ] {
         assert!(tekes_memory::client::validate_endpoint(url).is_err())
     }
+}
+
+#[test]
+fn stdio_reports_unsupported_id_when_input_ends() {
+    let s = Service::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
+        .args(["stdio", "--endpoint", &s.url, "--credential-file"])
+        .arg(s.credential("model"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        r#"{{"jsonrpc":"2.0","id":9223372036854775808,"method":"ping"}}"#
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let error =
+        decode(&output.stdout).expect("unsupported ID must produce a protocol error before exit");
+    assert_eq!(error["id"], Value::Null);
+    assert_eq!(error["error"]["code"], -32600);
 }
 #[test]
 #[ignore = "requires MCP_SDK_ROOT and Node.js; runs official upstream SDK against Rust service"]

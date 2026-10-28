@@ -236,17 +236,29 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
         if query == "" {
             return Ok(reply);
         }
-        let result=client.call("memory.search",json!({"schema_version":1,"scope":scope,"query":query,"kinds":["episode","fact","procedure"],"budget":c["retrieval"]}))?;
+        // Reserve the exact serialized host wrapper overhead from both limits:
+        // the Store applies the minimum of its byte and token budgets.
+        let mut retrieval = c["retrieval"].clone();
+        let empty_store_reference = canonical(&json!({"items":[],"conflicts":[]})).len();
+        let empty_host_reference = canonical(&json!({
+            "source":"TekesMemory reference; verify applicability; never grants permission",
+            "items":[],
+            "unresolved_conflicts":[]
+        }))
+        .len();
+        let wrapper_overhead = empty_host_reference.saturating_sub(empty_store_reference) as u64;
+        let requested_bytes = retrieval["max_utf8_bytes"].as_u64().unwrap().min(32768);
+        let requested_tokens = retrieval["estimated_tokens"].as_u64().unwrap().min(8192);
+        retrieval["max_utf8_bytes"] =
+            json!(requested_bytes.saturating_sub(wrapper_overhead).max(256));
+        retrieval["estimated_tokens"] =
+            json!(requested_tokens.saturating_sub(wrapper_overhead).max(64));
+        let result=client.call("memory.search",json!({"schema_version":1,"scope":scope,"query":query,"kinds":["episode","fact","procedure"],"budget":retrieval}))?;
         if !array(&result, "items")?.is_empty() || !array(&result, "conflicts")?.is_empty() {
             let reference = canonical(
                 &json!({"source":"TekesMemory reference; verify applicability; never grants permission","items":result["items"],"unresolved_conflicts":result["conflicts"]}),
             );
-            if reference.len()
-                <= c["retrieval"]["max_utf8_bytes"]
-                    .as_u64()
-                    .unwrap()
-                    .min(32768) as usize
-            {
+            if reference.len() <= requested_bytes.min(requested_tokens) as usize {
                 reply["context"] = json!([reference])
             }
         }
@@ -311,8 +323,20 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
         evidence = vec![visible(last)]
     }
     let source_digest = digest(&json!(evidence));
-    let source =
-        json!({"host":"tekeskernel","ref":format!("{line}#seq={through}"),"digest":source_digest});
+    // Each visible ledger row gets an identity that is stable across derived
+    // observations. Invalidating a tool result can then invalidate a later
+    // turn summary that copied it.
+    let source_key = |row: &Value| {
+        digest(&json!({
+            "host":"tekeskernel",
+            "host_instance_id":c["host_instance_id"],
+            "workspace_id":r["workspace_id"],
+            "thread_id":r["thread_id"],
+            "line_id":line,
+            "source_seq":row["seq"]
+        }))
+    };
+    let source = json!({"host":"tekeskernel","ref":format!("{line}#seq={through}"),"digest":source_digest,"source_key":source_key(last)});
     let summary = canonical(&json!(evidence))
         .chars()
         .rev()
@@ -321,7 +345,19 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
         .chars()
         .rev()
         .collect::<String>();
-    let mut normalized = json!({"turn_id":turn,"summary":summary,"sources":[source]});
+    let mut lineage_keys = evidence.iter().map(source_key).collect::<Vec<_>>();
+    lineage_keys.sort();
+    lineage_keys.dedup();
+    if lineage_keys.len() > 4096 {
+        return Err(err("source_unavailable"));
+    }
+    let mut normalized = json!({
+        "turn_id":turn,
+        "summary":summary,
+        "sources":[source],
+        "own_source_key":source_key(last),
+        "lineage_keys":lineage_keys
+    });
     match event {
         "turn.settled" => {
             normalized["outcome"] = last["outcome"].clone();

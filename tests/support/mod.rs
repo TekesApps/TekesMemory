@@ -116,7 +116,7 @@ impl Service {
             json!({"kind":"input","seq":2,"content":[{"type":"text","text":"How to run project tests"}]}),
             json!({"kind":"turn_open","seq":3,"turn":1,"trigger":{"inputs":[2]}}),
             json!({"kind":"tool_call","seq":4,"turn":1,"call":"c","name":"shell"}),
-            json!({"kind":"tool_result","seq":5,"turn":1,"call":"c","status":"ok"}),
+            json!({"kind":"tool_result","seq":5,"turn":1,"call":"c","status":"ok","content":[{"type":"text","text":"AUDITLINEAGEMARKER original tool output"}]}),
             json!({"kind":"output","seq":6,"turn":1,"content":[{"type":"text","text":"Project tests passed"},{"type":"thinking","thinking":"HIDDEN_REASONING"}]}),
             json!({"kind":"settle","seq":7,"turn":1,"outcome":"completed"}),
         ];

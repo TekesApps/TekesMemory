@@ -37,7 +37,16 @@ workspace 查询可合并被授权的 user scope；thread 查询可合并被授�
 
 写操作以 principal + scope + idempotency_key 去重，并校验请求 digest。相同键的原返回值保持稳定；查询 get/status 才反映当前状态。相同来源身份、序号、类型和 digest 的重复交付不生成新 observation；相同源 digest 携带不同正文被拒绝。
 
+脱敏只处理 save 的 content/fact/procedure、correct 的 replacement/fact/procedure，以及
+observation 的 summary/reason。scope、记录 ID、来源引用、事件身份与幂等身份保持原值，
+数据库操作使用通过鉴权的同一作用域。
+
 后台任务每次在一个事务中整理一条情景，因此进程崩溃会提交全部或回滚全部，无跨进程任务租约。处理失败最多重试五次，指数间隔后成为 failed。turn_opened 和 source_invalidated 不生成多余情景正文。没有模型提炼器、自动候选晋升或技能安装器。
+
+派生 observation 保留上游 `lineage_keys` 与当前事件的 `own_source_key`，新服务与 adapter
+应配套升级。已永久失效的来源在接收事务内传播删除，返回 `accepted:true`、
+`processing_state:deleted`，不保留正文或待处理任务；正常来源修订允许同身份的新 digest
+重新采集。升级不会重建旧版已经丢失的聚合来源身份，详见 [来源设计](design/lineage-forget.md)。
 
 数据库 schema 版本为 1，更高版本拒绝写入。配置文件为 0600，数据目录为 0700。SQLite FULL 同步与单进程 flock 保护写入，FTS5 secure-delete 配合 SQLite secure_delete；[SQLite 的说明](https://www.sqlite.org/fts5.html#the_secure_delete_configuration_option)解释了两者的不同覆盖范围。服务不承诺擦除 APFS 快照、磁盘历史或外部备份。
 
@@ -49,9 +58,13 @@ Kernel 扩展只读配置允许的 thread_root，规范化系统路径别名后�
 
 Kernel 成功回执可重放过去的 context；Memory 删除不会修改这个回执、宿主原始日志或实际请求资产。服务 TTL 与删除后重放防护也无法撤回此前已发送的内容。
 
+## 搜索索引与结果预算
+
+文档索引覆盖完整合法正文；查询分词最多保留 256 个不同 token。索引规则变更时，服务按 `search_index_version` 在现有数据库上重建 FTS 内容，不改数据库或记录 schema。搜索项保留 id、revision、kind、content、status、sources、verified_at 和 expires_at；当正文超出搜索预算时返回 query-centered excerpt 并标记 `content_truncated`。response `truncated` 表示正文有省略或仍有更多匹配项。`budget.utf8_bytes` 按最终序列化 `items` 与 `conflicts` 计费；完整记录始终可按 ID 用 `memory.get` 读取。
+
 ## 预算与兼容边界
 
-请求体至多 2MiB，查询最多 100 条，返回参考数据至多 32KiB。当前估算器为 UTF-8 字节上界，故 estimated_tokens=1500 可能明显少于 1500 个模型 token；不是准确 tokenizer。Kernel 扩展再检查最终包装文本上限。
+请求体至多 2MiB，响应体至多 8MiB（独立于请求上限），查询最多 100 条，返回参考数据至多 32KiB。读取响应采用独立的 8MiB 解析界限；超过界限不会作为完整成功响应交付。写入 Store 前检查工具参数预算；记录落盘前检查完整 get 响应封装的大小，后台 observation 入队前也检查生成记录的大小，因此超限返回 `budget_exceeded` 且不会提交不可读记录。JSON-RPC ID 支持有符号 64 位整数和字符串，超出范围的数字 ID 返回 `-32600` 请求错误；传输 JSON 使用保留整数精度的普通 JSON 序列化，JCS 仍仅用于规范化摘要等用途。当前估算器为 UTF-8 字节上界，故 estimated_tokens=1500 可能明显少于 1500 个模型 token；不是准确 tokenizer。Kernel 扩展再检查最终包装文本上限。
 
 常驻服务最多 32 个并发 MCP 请求、1024 个会话，每个会话最长一小时；短扩展调用主动关闭会话。只支持本机 loopback，不提供远程部署、浏览器跨域通配、TLS 或跨机器同步。DSH 等客户端可用显式 MCP 工具，自动生命周期适配尚需单独实现与验证。
 

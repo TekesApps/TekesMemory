@@ -160,6 +160,16 @@
               "maxItems": 64,
               "minItems": 1
             },
+            "lineage_keys": {
+              "type": "array",
+              "items": {"type":"string","minLength":1,"maxLength":64},
+              "maxItems": 4096
+            },
+            "own_source_key": {
+              "type":"string",
+              "minLength":1,
+              "maxLength":64
+            },
             "outcome": {
               "type": "string",
               "minLength": 1,

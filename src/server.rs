@@ -152,7 +152,7 @@ fn response(code: u16, value: Option<Value>, session: Option<&str>) -> Response 
         builder = builder.header("MCP-Session-Id", s);
     }
     builder
-        .body(Body::from(value.map(|v| canonical(&v)).unwrap_or_default()))
+        .body(Body::from(value.map(|v| wire_json(&v)).unwrap_or_default()))
         .unwrap()
 }
 fn header<'a>(h: &'a HeaderMap, k: &str) -> &'a str {
@@ -279,6 +279,17 @@ async fn handle(State(state): State<HttpState>, request: Request) -> Response {
                 );
             }
         };
+        if !supported_rpc_id(&value) {
+            return response(
+                200,
+                Some(rpc_error(
+                    Value::Null,
+                    -32600,
+                    "Request id must be a signed 64-bit integer or string",
+                )),
+                None,
+            );
+        }
         if value["method"] == "initialize" {
             initialize_guard = Some(state.initialize_gate.lock().await);
             if state.manager.sessions.read().await.len() >= 1024 {
@@ -301,7 +312,7 @@ async fn handle(State(state): State<HttpState>, request: Request) -> Response {
                 return response(400, None, None);
             }
         }
-        let encoded = canonical(&value);
+        let encoded = wire_json(&value);
         parts.headers.remove("transfer-encoding");
         parts
             .headers
@@ -358,7 +369,7 @@ async fn handle(State(state): State<HttpState>, request: Request) -> Response {
         // adapt its one terminal request stream back to the established JSON HTTP contract.
         let raw = match tokio::time::timeout(
             Duration::from_secs(30),
-            to_bytes(Body::new(body), MAX_BODY * 2),
+            to_bytes(Body::new(body), MAX_RESPONSE),
         )
         .await
         {
@@ -379,7 +390,7 @@ async fn handle(State(state): State<HttpState>, request: Request) -> Response {
             if data.is_empty() {
                 continue;
             }
-            let value = match decode(data.as_bytes()) {
+            let value = match decode_response(data.as_bytes()) {
                 Ok(value) => value,
                 Err(_) => return response(500, None, None),
             };
@@ -403,12 +414,21 @@ async fn handle(State(state): State<HttpState>, request: Request) -> Response {
         parts
             .headers
             .insert("cache-control", "no-store".parse().unwrap());
-        return Response::from_parts(parts, Body::from(canonical(&value)));
+        return Response::from_parts(parts, Body::from(wire_json(&value)));
     }
+    let raw = match tokio::time::timeout(
+        Duration::from_secs(30),
+        to_bytes(Body::new(body), MAX_RESPONSE),
+    )
+    .await
+    {
+        Ok(Ok(raw)) => raw,
+        _ => return response(503, None, None),
+    };
     parts
         .headers
         .insert("cache-control", "no-store".parse().unwrap());
-    Response::from_parts(parts, Body::new(body))
+    Response::from_parts(parts, Body::from(raw))
 }
 
 pub async fn serve(config_path: &Path, ready: Option<&Path>) -> Result<()> {

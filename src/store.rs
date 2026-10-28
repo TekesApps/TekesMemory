@@ -20,7 +20,82 @@ fn valid_effect_key(key: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
+fn scrub_write_args(name: &str, args: &Value) -> Value {
+    let mut safe = args.clone();
+    // Scope, source references, event IDs, and idempotency inputs are identities; redact only
+    // fields that carry user-authored memory text so those identities remain exact.
+    let fields: &[&str] = match name {
+        "memory.save" => &["content", "fact", "procedure"],
+        "memory.correct" => &["replacement", "fact", "procedure"],
+        "memory.observe" => &[],
+        _ => &[],
+    };
+    for field in fields {
+        if let Some(value) = args.get(*field) {
+            safe[*field] = scrub(value);
+        }
+    }
+    if name == "memory.observe" {
+        for field in ["summary", "reason"] {
+            if let Some(value) = args.pointer(&format!("/observation/payload/{field}")) {
+                safe["observation"]["payload"][field] = scrub(value);
+            }
+        }
+    }
+    safe
+}
+fn derived_record_args(scope: Value, obs: &Value, key: &str) -> Result<Value> {
+    let mut sources = array(&obs["payload"], "sources")?.clone();
+    if let Some(source_key) = obs["payload"]["own_source_key"].as_str()
+        && !sources
+            .iter()
+            .any(|source| source["source_key"] == source_key)
+    {
+        sources.push(json!({
+            "host":"tekes-memory-lineage",
+            "ref":source_key,
+            "digest":source_key,
+            "source_key":source_key
+        }));
+    }
+    if let Some(lineage) = obs["payload"]["lineage_keys"].as_array() {
+        for source_key in lineage.iter().filter_map(Value::as_str) {
+            if !sources
+                .iter()
+                .any(|source| source["source_key"] == source_key)
+            {
+                sources.push(json!({
+                    "host":"tekes-memory-lineage",
+                    "ref":source_key,
+                    "digest":source_key,
+                    "source_key":source_key
+                }));
+            }
+        }
+    }
+    if !sources.iter().any(|source| source["source_key"] == key) {
+        sources.push(json!({
+            "host":"tekes-memory",
+            "ref":key,
+            "digest":digest(obs),
+            "source_key":key
+        }));
+    }
+    let mut summary = obs["payload"].clone();
+    let payload = summary
+        .as_object_mut()
+        .ok_or_else(|| err("invalid_argument"))?;
+    payload.remove("sources");
+    payload.remove("own_source_key");
+    payload.remove("lineage_keys");
+    summary["observation"] = obs["type"].clone();
+    let content = canonical(&summary).chars().take(32768).collect::<String>();
+    Ok(json!({"scope":scope,"kind":"episode","content":content,"sources":sources}))
+}
 pub fn words(s: &str) -> Vec<String> {
+    words_limited(s, None)
+}
+fn words_limited(s: &str, limit: Option<usize>) -> Vec<String> {
     use std::sync::LazyLock;
     static WORD: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new("[a-z0-9_]+|[\\u{3400}-\\u{9fff}]+").unwrap());
@@ -37,13 +112,16 @@ pub fn words(s: &str) -> Vec<String> {
         for t in tokens {
             if seen.insert(t.clone()) {
                 out.push(t);
-                if out.len() == 256 {
+                if limit.is_some_and(|limit| out.len() == limit) {
                     return out;
                 }
             }
         }
     }
     out
+}
+fn query_words(s: &str) -> Vec<String> {
+    words_limited(s, Some(256))
 }
 impl Store {
     pub fn open(path: &Path, episode_days: i64) -> Result<Self> {
@@ -64,6 +142,41 @@ impl Store {
             [format!("{}{}", uid(), uid())],
         )?;
         db.execute("INSERT OR IGNORE INTO meta VALUES('generation','0')", [])?;
+        // The original indexer shared the 256-token query cap. Rebuild once on
+        // upgrade so existing records receive the complete document index.
+        let index_version: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='search_index_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if index_version.as_deref() != Some("2") {
+            db.execute_batch("BEGIN IMMEDIATE; DELETE FROM search_index;")?;
+            let docs = {
+                let mut stmt = db
+                    .prepare("SELECT id,doc FROM records WHERE status IN ('active','contested')")?;
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (id, doc) in docs {
+                let record: Value = serde_json::from_str(&doc)?;
+                db.execute(
+                    "INSERT INTO search_index VALUES(?,?)",
+                    params![
+                        id,
+                        words(&format!(
+                            "{} {}",
+                            record["content"].as_str().unwrap_or_default(),
+                            canonical(&record["fact"])
+                        ))
+                        .join(" ")
+                    ],
+                )?;
+            }
+            db.execute("INSERT INTO meta(key,value) VALUES('search_index_version','2') ON CONFLICT(key) DO UPDATE SET value='2'", [])?;
+            db.execute_batch("COMMIT")?;
+        }
         Ok(Self {
             db,
             episode_days,
@@ -140,6 +253,9 @@ impl Store {
         {
             return Err(err("scope_denied"));
         }
+        if wire_json(a).len() > MAX_BODY {
+            return Err(err("budget_exceeded"));
+        }
         validate(a, SCHEMAS.get(name).ok_or_else(|| err("invalid_argument"))?)?;
         if let Some(scope) = a.get("scope") {
             authorize(p, scope)?;
@@ -213,7 +329,7 @@ impl Store {
                 }
                 serde_json::from_str(&result)?
             } else {
-                let safe = scrub(a);
+                let safe = scrub_write_args(name, a);
                 let mut r = match name {
                     "memory.save" => self.save(&safe)?,
                     "memory.correct" => self.correct(&safe)?,
@@ -299,6 +415,45 @@ impl Store {
         }
         .into())
     }
+    fn search_hit(mut record: Value, query: &str, available_bytes: usize) -> Option<Value> {
+        let original = record["content"].as_str()?.to_owned();
+        if canonical(&record).len() <= available_bytes {
+            return Some(record);
+        }
+
+        // Keep the matching passage when possible, then fit it to the remaining
+        // byte budget without cutting a UTF-8 code point.
+        let lowercase = original.to_lowercase();
+        let start = words(query)
+            .into_iter()
+            .find_map(|token| lowercase.find(&token))
+            .unwrap_or(0);
+        let start = original
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= start)
+            .last()
+            .unwrap_or(0);
+        let passage = &original[start..];
+        let mut low = 0usize;
+        let mut high = passage.chars().count();
+        let mut best = None;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let excerpt = passage.chars().take(mid).collect::<String>();
+            record["content"] = json!(excerpt);
+            record["content_truncated"] = json!(mid < original.chars().count());
+            if canonical(&record).len() <= available_bytes {
+                best = Some(record.clone());
+                low = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                high = mid - 1;
+            }
+        }
+        best
+    }
     fn get(&self, a: &Value) -> Result<Value> {
         let mut r = self.row(&a["scope"], text(a, "id")?)?;
         if let Some(rev) = a.get("revision") {
@@ -320,9 +475,11 @@ impl Store {
                 return Err(err("not_found"));
             }
         }
+        ensure_record_readable(&r)?;
         Ok(json!({"item":r}))
     }
     fn put(&self, r: &Value) -> Result<()> {
+        ensure_record_readable(r)?;
         let id = text(r, "id")?;
         let doc = canonical(r);
         self.db.execute(
@@ -522,6 +679,68 @@ impl Store {
         self.db.execute("UPDATE jobs SET state='completed' WHERE id IN (SELECT id FROM observations WHERE scope=? AND source_key=?)",params![scope,key])?;
         Ok(())
     }
+    fn clear_lineage_dependents(&self, scope: &str, key: &str, block: bool) -> Result<Vec<String>> {
+        let mut queue = vec![key.to_owned()];
+        let mut seen = BTreeSet::new();
+        while let Some(key) = queue.pop() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if block {
+                self.db.execute(
+                    "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                    params![scope, key],
+                )?;
+            }
+            let rows = self.db.prepare(
+                "SELECT o.id,o.source_key,o.payload,j.state FROM observations o LEFT JOIN jobs j ON j.id=o.id WHERE o.scope=? AND o.payload!='{}'"
+            )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (id, own_key, payload, job_state) in rows {
+                let payload: Value = serde_json::from_str(&payload)?;
+                let depends_on_key = own_key == key
+                    || payload["payload"]["own_source_key"] == key
+                    || payload["payload"]["sources"]
+                        .as_array()
+                        .is_some_and(|sources| {
+                            sources.iter().any(|source| source["source_key"] == key)
+                        })
+                    || payload["payload"]["lineage_keys"]
+                        .as_array()
+                        .is_some_and(|keys| keys.iter().any(|source_key| source_key == &key));
+                if depends_on_key {
+                    let aliases = payload["payload"]["own_source_key"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    if block {
+                        for alias in &aliases {
+                            self.db.execute(
+                                "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                                params![scope, alias],
+                            )?;
+                        }
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                            params![scope, own_key],
+                        )?;
+                    }
+                    self.db.execute(
+                        "UPDATE observations SET payload='{}',state='deleted' WHERE id=?",
+                        [&id],
+                    )?;
+                    if job_state.is_some() {
+                        self.db
+                            .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+                    }
+                    queue.push(own_key);
+                    queue.extend(aliases);
+                }
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
     fn erase(&self, scope: &str, ids: Vec<String>, block: bool) -> Result<usize> {
         let mut queue = ids;
         let mut seen = BTreeSet::new();
@@ -541,18 +760,23 @@ impl Store {
             {
                 continue;
             }
-            for key in self.strings(
-                "SELECT source_key FROM dependencies WHERE record_id=?",
-                [&id],
-            )? {
-                if block {
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
-                        params![scope, key],
-                    )?;
+            let mut own_keys = self.strings(
+                "SELECT source_key FROM observations WHERE scope=? AND record_id=?",
+                params![scope, id],
+            )?;
+            // Explicitly saved records have no originating observation. Preserve
+            // their existing keyed-source closure, including historical sources.
+            if own_keys.is_empty() {
+                own_keys = self.strings(
+                    "SELECT source_key FROM dependencies WHERE record_id=?",
+                    [&id],
+                )?;
+            }
+            for key in own_keys {
+                let invalidated = self.clear_lineage_dependents(scope, &key, block)?;
+                for invalidated_key in invalidated {
+                    queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![invalidated_key,scope])?);
                 }
-                queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![key,scope])?);
-                self.clear_source(scope, &key, "deleted")?;
             }
             self.db.execute("DELETE FROM versions WHERE id=?", [&id])?;
             self.db
@@ -561,6 +785,14 @@ impl Store {
                 .execute("DELETE FROM dependencies WHERE record_id=?", [&id])?;
             self.db.execute(
                 "UPDATE records SET status='deleted',doc='{}' WHERE id=?",
+                [&id],
+            )?;
+            self.db.execute(
+                "UPDATE observations SET payload='{}',state='deleted' WHERE record_id=?",
+                [&id],
+            )?;
+            self.db.execute(
+                "UPDATE jobs SET state='completed' WHERE id IN (SELECT id FROM observations WHERE record_id=?)",
                 [&id],
             )?;
         }
@@ -640,6 +872,36 @@ impl Store {
             identity[k] = event[k].clone()
         }
         let key = digest(&identity);
+        let mut blocked = false;
+        if typ != "source_invalidated" {
+            let record_args = derived_record_args(a["scope"].clone(), obs, &key)?;
+            for source in array(&record_args, "sources")? {
+                if let Some(source_key) = source["source_key"].as_str()
+                    && self
+                        .db
+                        .query_row(
+                            "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                            params![scope, source_key],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .is_some()
+                {
+                    blocked = true;
+                }
+            }
+            let record = json!({
+                "id":"ffffffffffffffffffffffffffffffff",
+                "scope":record_args["scope"],"kind":record_args["kind"],
+                "revision":i64::MAX,"status":"contested",
+                "content":record_args["content"],"sources":record_args["sources"],
+                "observed_at":i64::MAX,"verified_at":i64::MAX,"pinned":true,
+                "expires_at":i64::MAX
+            });
+            if typ != "turn_opened" {
+                ensure_record_readable(&record)?;
+            }
+        }
         let old:Option<(String,String,String)>=self.db.query_row("SELECT id,state,payload FROM observations WHERE scope=? AND source_key=? AND digest=?",params![scope,key,text(event,"source_digest")?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((id, state, payload)) = old {
             if !matches!(state.as_str(), "deleted" | "expired") && payload != canonical(obs) {
@@ -662,6 +924,11 @@ impl Store {
             return Err(err("source_unavailable"));
         }
         let previous=self.strings("SELECT record_id FROM observations WHERE scope=? AND source_key=? AND record_id IS NOT NULL",params![scope,key])?;
+        let invalidated = self.clear_lineage_dependents(&scope, &key, false)?;
+        let mut previous = previous;
+        for invalidated_key in invalidated {
+            previous.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+        }
         self.erase(&scope, previous, false)?;
         self.clear_source(&scope, &key, "deleted")?;
         if typ == "source_invalidated" {
@@ -671,7 +938,11 @@ impl Store {
                     "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
                     params![scope, target],
                 )?;
-                let ids=self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,target])?;
+                let invalidated = self.clear_lineage_dependents(&scope, target, true)?;
+                let mut ids = Vec::new();
+                for invalidated_key in invalidated {
+                    ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+                }
                 self.erase(&scope, ids, true)?;
                 self.clear_source(&scope, target, "deleted")?;
             }
@@ -697,6 +968,19 @@ impl Store {
             "INSERT INTO jobs VALUES(?,?,0,?,NULL)",
             params![id, state, (self.clock)()],
         )?;
+        let state = if blocked {
+            // Do not leave an already-invalid source queued until maintenance:
+            // a later child could otherwise publish first through its raw alias.
+            let invalidated = self.clear_lineage_dependents(&scope, &key, true)?;
+            let mut ids = Vec::new();
+            for source_key in invalidated {
+                ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?", params![scope, source_key])?);
+            }
+            self.erase(&scope, ids, true)?;
+            "deleted"
+        } else {
+            state
+        };
         Ok(json!({"accepted":true,"observation_id":id,"processing_state":state,"source_key":key}))
     }
     pub fn maintain(&self) -> Result<bool> {
@@ -733,18 +1017,34 @@ impl Store {
                 job_id = Some(id.clone());
                 attempts = count;
                 let obs: Value = serde_json::from_str(&payload)?;
-                let mut sources = array(&obs["payload"], "sources")?.clone();
-                for s in &mut sources {
-                    s["source_key"] = json!(key)
+                let record_args = derived_record_args(serde_json::from_str(&scope)?, &obs, &key)?;
+                let mut blocked = false;
+                for source in array(&record_args, "sources")? {
+                    if let Some(source_key) = source["source_key"].as_str()
+                        && self
+                            .db
+                            .query_row(
+                                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                                params![scope, source_key],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .optional()?
+                            .is_some()
+                    {
+                        blocked = true;
+                        break;
+                    }
                 }
-                let mut summary = obs["payload"].clone();
-                summary
-                    .as_object_mut()
-                    .ok_or_else(|| err("invalid_argument"))?
-                    .remove("sources");
-                summary["observation"] = obs["type"].clone();
-                let content = canonical(&summary).chars().take(32768).collect::<String>();
-                let saved=self.save(&json!({"scope":serde_json::from_str::<Value>(&scope)?,"kind":"episode","content":content,"sources":sources}))?;
+                if blocked {
+                    let invalidated = self.clear_lineage_dependents(&scope, &key, true)?;
+                    let mut dependent_ids = Vec::new();
+                    for invalidated_key in invalidated {
+                        dependent_ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+                    }
+                    self.erase(&scope, dependent_ids, true)?;
+                    return Ok(());
+                }
+                let saved = self.save(&record_args)?;
                 self.db.execute(
                     "UPDATE observations SET state='completed',record_id=? WHERE id=?",
                     params![text(&saved, "id")?, id],
@@ -846,7 +1146,7 @@ impl Store {
                 .map(|v| SqlValue::Text(v.as_str().unwrap().into())),
         );
         params.push(SqlValue::Integer((self.clock)()));
-        let tokens = words(text(a, "query")?);
+        let tokens = query_words(text(a, "query")?);
         let (base, order) = if tokens.is_empty() {
             ("SELECT doc FROM records WHERE ", "id")
         } else {
@@ -873,36 +1173,47 @@ impl Store {
         )?;
         let mut items = vec![];
         let mut conflicts = vec![];
-        let mut used = 0;
         let mut consumed = 0;
+        let mut content_truncated = false;
         let cap = a["budget"]["max_utf8_bytes"]
             .as_u64()
             .unwrap()
             .min(a["budget"]["estimated_tokens"].as_u64().unwrap()) as usize;
+        let mut omitted_for_budget = false;
         for mut r in rows.clone() {
             if !self.valid(&r["fact"]) {
                 consumed += 1;
                 continue;
             }
             r["status"] = json!(self.current_status(&r)?);
-            let size = canonical(&r).len();
             if items.len() + conflicts.len() >= a["budget"]["max_items"].as_u64().unwrap() as usize
             {
                 break;
             }
-            if size > cap {
+            let contested = r["status"] == "contested";
+            let used = canonical(&json!({"items":items,"conflicts":conflicts})).len();
+            let remaining_record_bytes = cap.saturating_sub(used.saturating_add(1));
+            let Some(r) = Self::search_hit(r.clone(), text(a, "query")?, remaining_record_bytes)
+            else {
+                let empty_reference_bytes = canonical(&json!({"items":[],"conflicts":[]})).len();
+                let fresh_page_record_bytes =
+                    cap.saturating_sub(empty_reference_bytes.saturating_add(1));
+                if Self::search_hit(r.clone(), text(a, "query")?, fresh_page_record_bytes).is_some()
+                {
+                    // This result fits on a new page; leave it unconsumed so the
+                    // signed cursor resumes at this row instead of losing it.
+                    break;
+                }
+                omitted_for_budget = true;
                 consumed += 1;
                 continue;
-            }
-            if used + size > cap {
-                break;
-            }
-            if r["status"] == "contested" {
+            };
+            content_truncated |= r["content_truncated"] == true;
+            if contested {
                 conflicts.push(r)
             } else {
                 items.push(r)
             }
-            used += size;
             consumed += 1;
         }
         let more = consumed < rows.len() || rows.len() == 1001;
@@ -921,7 +1232,7 @@ impl Store {
             None
         };
         Ok(
-            json!({"items":items,"conflicts":conflicts,"next_cursor":cursor,"truncated":more,"budget":{"utf8_bytes":used,"estimator":"utf8-byte-upper-bound","max_bytes":cap}}),
+            json!({"items":items,"conflicts":conflicts,"next_cursor":cursor,"truncated":more || content_truncated || omitted_for_budget,"budget":{"utf8_bytes":canonical(&json!({"items":items,"conflicts":conflicts})).len(),"estimator":"utf8-byte-upper-bound","max_bytes":cap}}),
         )
     }
 }

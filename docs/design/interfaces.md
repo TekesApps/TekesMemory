@@ -56,7 +56,7 @@
 }
 ```
 
-搜索输出的每项至少包含 `id / revision / kind / content / status / sources / verified_at / expires_at`。预算对最终序列化参考材料计费，包含引用和状态标签。过期、已删除、无权限数据不得出现在结果、数量统计或错误详情中。
+搜索输出的每项至少包含 `id / revision / kind / content / status / sources / verified_at / expires_at`。预算对最终序列化参考材料计费，包含引用和状态标签。超长正文可返回 query-centered excerpt，使用 `content_truncated` 和 response `truncated` 明确标记省略；完整正文仍由 `memory.get` 提供。过期、已删除、无权限数据不得出现在结果、数量统计或错误详情中。
 
 ## 3. Observation：业务语义与宿主事件分离
 

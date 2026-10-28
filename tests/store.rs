@@ -89,6 +89,198 @@ fn restart_and_exact_retry() {
     changed["content"] = json!("different");
     f.error("idempotency_conflict", "save", changed)
 }
+
+#[test]
+fn search_finds_tokens_after_legacy_index_limit_for_new_and_corrected_records() {
+    let f = Fixture::new();
+    let english = (0..270)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " uniquetail";
+    let mut a = save("long-english");
+    a["content"] = json!(english);
+    let saved = f.call("save", a);
+    let mut q = search();
+    q["query"] = json!("uniquetail");
+    assert_eq!(
+        f.call("search", q.clone())["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let chinese = (0..270)
+        .map(|i| format!("中{i}词"))
+        .collect::<Vec<_>>()
+        .join("，")
+        + " 中文尾词独有";
+    let mut correction = f.correct(&saved["id"]);
+    correction["replacement"] = json!(chinese);
+    f.call("correct", correction);
+    q["query"] = json!("独有");
+    assert_eq!(f.call("search", q)["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn opening_legacy_index_rebuilds_full_document_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.sqlite3");
+    let store = Store::open(&path, 90).unwrap();
+    let f = Fixture {
+        _dir: tempfile::tempdir().unwrap(),
+        store,
+    };
+    let content = (0..270)
+        .map(|i| format!("old{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " migratedtail";
+    let mut a = save("legacy-reindex");
+    a["content"] = json!(content);
+    f.call("save", a);
+    let partial = tekes_memory::store::words(
+        &(" ".to_owned()
+            + &(0..270)
+                .map(|i| format!("old{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")),
+    )
+    .into_iter()
+    .take(256)
+    .collect::<Vec<_>>();
+    f.store
+        .db
+        .execute(
+            "UPDATE search_index SET words=? WHERE id=(SELECT id FROM records LIMIT 1)",
+            [partial.join(" ")],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute("DELETE FROM meta WHERE key='search_index_version'", [])
+        .unwrap();
+    drop(f);
+
+    let reopened = Store::open(&path, 90).unwrap();
+    let f = Fixture {
+        _dir: tempfile::tempdir().unwrap(),
+        store: reopened,
+    };
+    let mut q = search();
+    q["query"] = json!("migratedtail");
+    assert_eq!(f.call("search", q)["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn search_returns_budget_fitting_excerpt_and_get_keeps_full_record() {
+    let f = Fixture::new();
+    let content = "findme ".to_owned() + &"x".repeat(9000);
+    let mut a = save("large-search-hit");
+    a["content"] = json!(content);
+    let saved = f.call("save", a);
+    let mut q = search();
+    q["query"] = json!("findme");
+    q["budget"]["max_utf8_bytes"] = json!(8192);
+    q["budget"]["estimated_tokens"] = json!(8192);
+    let result = f.call("search", q);
+    let hit = &result["items"][0];
+    assert_eq!(hit["id"], saved["id"]);
+    assert_eq!(hit["scope"], scope());
+    assert_eq!(hit["sources"][0], source());
+    assert_eq!(hit["content_truncated"], true);
+    assert!(
+        canonical(&json!({"items":result["items"],"conflicts":result["conflicts"]})).len() <= 8192
+    );
+    assert_eq!(result["truncated"], true);
+    assert_eq!(
+        f.call("get", f.get(&saved["id"]))["item"]["content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        9007
+    );
+}
+
+#[test]
+fn search_skips_metadata_that_cannot_fit_and_continues_to_later_hits() {
+    let f = Fixture::new();
+    let mut huge = save("huge-source-metadata");
+    huge["content"] = json!("findme");
+    huge["sources"] = json!((0..64).map(|i| json!({"host":"test","ref":format!("{i}#{}", "🙂".repeat(4000)),"digest":"a".repeat(64)})).collect::<Vec<_>>());
+    let large = f.call("save", huge);
+    let mut small_input = save("small-hit");
+    small_input["content"] = json!("findme small-hit");
+    let small = f.call("save", small_input);
+    // Give equal-ranked matches deterministic ordering: metadata-only oversized
+    // hit first, then a normal hit that must still be returned.
+    f.store
+        .db
+        .execute(
+            "UPDATE records SET id='a-large' WHERE id=?",
+            [&large["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE search_index SET id='a-large' WHERE id=?",
+            [&large["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE records SET id='z-small' WHERE id=?",
+            [&small["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE search_index SET id='z-small' WHERE id=?",
+            [&small["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let mut q = search();
+    q["query"] = json!("findme");
+    q["budget"]["max_utf8_bytes"] = json!(8192);
+    q["budget"]["estimated_tokens"] = json!(8192);
+    let result = f.call("search", q);
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["items"][0]["content"], "findme small-hit");
+    assert_eq!(result["truncated"], true);
+    assert!(result["next_cursor"].is_null(), "{result}");
+    assert!(result["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
+}
+#[test]
+fn search_defers_hit_that_only_fits_on_a_fresh_page() {
+    let f = Fixture::new();
+    for key in ["long-page-one", "long-page-two"] {
+        let mut a = save(key);
+        a["content"] = json!(format!("findme {}", "🙂".repeat(3000)));
+        f.call("save", a);
+    }
+    let mut q = search();
+    q["query"] = json!("findme");
+    q["budget"]["max_utf8_bytes"] = json!(8192);
+    q["budget"]["estimated_tokens"] = json!(8192);
+    let first = f.call("search", q.clone());
+    assert_eq!(first["items"].as_array().unwrap().len(), 1, "{first}");
+    assert!(first["items"][0]["content_truncated"].as_bool().unwrap());
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("deferred result cursor");
+    assert!(first["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
+
+    q["cursor"] = json!(cursor);
+    let second = f.call("search", q.clone());
+    assert_eq!(second["items"].as_array().unwrap().len(), 1);
+    assert_ne!(second["items"][0]["id"], first["items"][0]["id"]);
+    assert!(second["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
+    assert!(second["next_cursor"].is_null());
+}
 #[test]
 fn kernel_effect_receipt_is_atomic_replayable_and_scope_bound() {
     let f = Fixture::new();
@@ -168,6 +360,130 @@ fn scope_and_operation_isolation() {
     let mut s = search();
     s["scope"]["thread_id"] = json!("t");
     f.error("scope_denied", "search", s)
+}
+#[test]
+fn write_scrubbing_preserves_authorized_identity_and_redacts_content() {
+    let f = Fixture::new();
+    let mut args = save("scope-repro-save");
+    args["scope"] = json!({
+        "kind":"thread",
+        "owner_id":"sk-1234567890123456",
+        "workspace_id":"ghp_0123456789abcdef0123456789",
+        "thread_id":"sk-threadidentifier123456"
+    });
+    args["content"] = json!("Bearer abcdefghijklmnop password=hunter2");
+    args["sources"][0]["ref"] = json!("fixture#sk-1234567890123456");
+    let mut owner = principal("model");
+    owner["owner_id"] = args["scope"]["owner_id"].clone();
+    owner["scopes"] = json!([args["scope"]]);
+    let saved = f.store.call(&owner, "memory.save", &args).unwrap();
+
+    let mut read = f.get(&saved["id"]);
+    read["scope"] = args["scope"].clone();
+    let item = f.store.call(&owner, "memory.get", &read).unwrap()["item"].clone();
+    assert_eq!(item["scope"], args["scope"]);
+    assert_eq!(item["sources"][0]["ref"], args["sources"][0]["ref"]);
+    assert!(
+        item["content"]
+            .as_str()
+            .unwrap()
+            .contains("Bearer [REDACTED]")
+    );
+    assert!(!item["content"].as_str().unwrap().contains("hunter2"));
+
+    let mut other = principal("model");
+    other["owner_id"] = args["scope"]["owner_id"].clone();
+    other["scopes"] = json!([{"kind":"thread","owner_id":args["scope"]["owner_id"],"workspace_id":"[REDACTED]","thread_id":"[REDACTED]"}]);
+    let mut other_read = f.get(&saved["id"]);
+    other_read["scope"] = other["scopes"][0].clone();
+    assert_eq!(
+        f.store
+            .call(&other, "memory.get", &other_read)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+}
+
+#[test]
+fn observation_source_identity_survives_redaction_patterns() {
+    let f = Fixture::new();
+    let mut args = observe("sk-1234567890123456");
+    args["scope"] = json!({"kind":"thread","owner_id":"u","workspace_id":"sk-1234567890123456","thread_id":"ghp_0123456789abcdef0123456789"});
+    args["source_event"]["workspace_id"] = json!("sk-1234567890123456");
+    args["source_event"]["thread_id"] = json!("ghp_0123456789abcdef0123456789");
+    args["source_event"]["event_id"] = json!("Bearer eventidentity0123456789");
+    args["observation"]["type"] = json!("source_invalidated");
+    args["observation"]["payload"]["source_keys"] =
+        json!(["sk-123456789012345678901234567890123456789012345678901234567890"]);
+    args["observation"]["payload"]["summary"] = json!("Bearer abcdefghijklmnop");
+    let mut p = principal("adapter");
+    p["scopes"] = json!([args["scope"]]);
+    let accepted = f.store.call(&p, "memory.observe", &args).unwrap();
+    assert_eq!(accepted["accepted"], true);
+    let payload: String = f
+        .store
+        .db
+        .query_row(
+            "SELECT payload FROM observations WHERE id=?",
+            [accepted["observation_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        stored["payload"]["source_keys"],
+        args["observation"]["payload"]["source_keys"]
+    );
+    assert!(
+        stored["payload"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Bearer [REDACTED]")
+    );
+    assert!(!f.store.maintain().unwrap());
+}
+
+#[test]
+fn known_other_scope_record_cannot_be_corrected_or_forgotten() {
+    let f = Fixture::new();
+    let mut other_scope = scope();
+    other_scope["workspace_id"] = json!("[REDACTED]");
+    let mut other = principal("model");
+    other["scopes"] = json!([other_scope]);
+    let mut other_save = save("other-save");
+    other_save["scope"] = other_scope.clone();
+    let other_record = f.store.call(&other, "memory.save", &other_save).unwrap();
+
+    let mut authorized_scope = scope();
+    authorized_scope["workspace_id"] = json!("sk-1234567890123456");
+    let mut owner = principal("model");
+    owner["scopes"] = json!([authorized_scope.clone()]);
+    let mut correct = f.correct(&other_record["id"]);
+    correct["scope"] = authorized_scope.clone();
+    assert_eq!(
+        f.store
+            .call(&owner, "memory.correct", &correct)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+    let mut forget = f.forget(&other_record["id"], 1);
+    forget["scope"] = authorized_scope;
+    assert_eq!(
+        f.store
+            .call(&owner, "memory.forget", &forget)
+            .unwrap_err()
+            .0,
+        "not_found"
+    );
+
+    let mut other_read = f.get(&other_record["id"]);
+    other_read["scope"] = other_scope;
+    assert_eq!(
+        f.store.call(&other, "memory.get", &other_read).unwrap()["item"]["content"],
+        other_save["content"]
+    );
 }
 #[test]
 fn model_cannot_forge_observation() {
@@ -320,7 +636,7 @@ fn source_revision_invalidates_derived_text() {
     let mut b = observe("new");
     b["source_event"]["source_digest"] = json!("c".repeat(64));
     b["observation"]["payload"]["summary"] = json!("NEW_SOURCE");
-    f.call("observe", b);
+    f.call("observe", b.clone());
     f.store.maintain().unwrap();
     let r = f.call("search", search());
     assert_eq!(r["items"].as_array().unwrap().len(), 1);
@@ -361,6 +677,578 @@ fn invalidation_cancels_pending_job() {
     f.call("observe", invalidation(&a["source_key"]));
     assert!(!f.store.maintain().unwrap());
     assert_eq!(f.call("search", search())["items"], json!([]))
+}
+#[test]
+fn explicit_source_dependencies_are_preserved_and_invalidated() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("source-a"));
+    f.store.maintain().unwrap();
+    let mut b = observe("derived-b");
+    b["source_event"]["source_seq"] = json!(10);
+    b["source_event"]["source_digest"] = json!("f".repeat(64));
+    b["observation"]["payload"]["summary"] = json!("DEPENDENT_PRIVATE_TEXT");
+    b["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    f.call("observe", b.clone());
+    f.store.maintain().unwrap();
+    assert_eq!(
+        f.call("search", search())["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    f.call("observe", invalidation(&a["source_key"]));
+    assert_eq!(f.call("search", search())["items"], json!([]));
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    let mut replay = b.clone();
+    replay["idempotency_key"] = json!("event-replayed-under-new-operation");
+    assert_eq!(
+        reopened
+            .call(&principal("adapter"), "memory.observe", &replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    assert!(!reopened.maintain().unwrap());
+    assert_eq!(
+        reopened
+            .call(&principal("model"), "memory.search", &search())
+            .unwrap()["items"],
+        json!([])
+    );
+    assert_eq!(
+        f.store
+            .db
+            .query_row("SELECT count(*) FROM versions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.store
+            .db
+            .query_row("SELECT count(*) FROM search_index", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn invalidation_cancels_pending_explicit_dependents() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("source-a"));
+    f.store.maintain().unwrap();
+    let mut b = observe("derived-b");
+    b["source_event"]["source_seq"] = json!(10);
+    b["source_event"]["source_digest"] = json!("f".repeat(64));
+    b["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    f.call("observe", b);
+    f.call("observe", invalidation(&a["source_key"]));
+    while f.store.maintain().unwrap() {}
+    assert_eq!(f.call("search", search())["items"], json!([]));
+}
+fn dependent_observation(key: &str, seq: u64, dependency: &Value) -> Value {
+    let mut child = observe(key);
+    child["source_event"]["source_seq"] = json!(seq);
+    child["source_event"]["source_digest"] = json!(format!("{:064x}", seq));
+    child["observation"]["payload"]["summary"] = json!(format!("DEPENDENT_{key}"));
+    child["observation"]["payload"]["own_source_key"] =
+        json!(digest(&json!({"test-own-source":key})));
+    child["observation"]["payload"]["lineage_keys"] = json!([dependency]);
+    child
+}
+#[test]
+fn source_invalidation_cancels_transitive_pending_lineage_keys() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("chain-a"));
+    f.store.maintain().unwrap();
+    let b = dependent_observation("chain-b", 10, &a["source_key"]);
+    let raw_b = json!("b".repeat(64));
+    let mut b = b;
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    let mut c = dependent_observation("chain-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+    let c_key = f.call("observe", c.clone())["source_key"].clone();
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&a["source_key"]));
+    assert!(!f.store.maintain().unwrap());
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_chain-b"));
+    assert!(!content.contains("DEPENDENT_chain-c"));
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), c_key.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_ok()
+    );
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    let mut replay = c;
+    replay["idempotency_key"] = json!("chain-c-replay-new-operation");
+    assert_eq!(
+        reopened
+            .call(&principal("adapter"), "memory.observe", &replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    assert!(!reopened.maintain().unwrap());
+}
+#[test]
+fn forgetting_source_cancels_transitive_pending_lineage_keys() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("chain-a"));
+    f.store.maintain().unwrap();
+    let a_record = f.call("search", search())["items"][0].clone();
+    let b = dependent_observation("chain-b", 10, &a["source_key"]);
+    let raw_b = json!("b".repeat(64));
+    let mut b = b;
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    let mut c = dependent_observation("chain-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+    f.call("observe", c);
+    f.call("forget", f.forget(&a_record["id"], 1));
+    assert!(!f.store.maintain().unwrap());
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_chain-b"));
+    assert!(!content.contains("DEPENDENT_chain-c"));
+}
+#[test]
+fn invalidation_cancels_processed_alias_dependents() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("processed-alias-a"));
+    f.store.maintain().unwrap();
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("processed-alias-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    f.store.maintain().unwrap();
+    let mut c = dependent_observation("processed-alias-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+    f.call("observe", c);
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&a["source_key"]));
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_processed-alias-b"));
+    assert!(!content.contains("DEPENDENT_processed-alias-c"));
+    let mut replay = observe("processed-alias-a-new-digest");
+    replay["source_event"]["source_digest"] = json!("c".repeat(64));
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &replay)
+            .unwrap_err()
+            .0,
+        "source_unavailable"
+    );
+}
+#[test]
+fn forgetting_derived_record_blocks_its_alias_without_tombstoning_upstream() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("upstream-a"));
+    f.store.maintain().unwrap();
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("derived-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    f.store.maintain().unwrap();
+    let b_record = f.call("search", search())["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("DEPENDENT_derived-b")
+        })
+        .unwrap()
+        .clone();
+    let mut c = dependent_observation("derived-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+    f.call("observe", c);
+    f.call("forget", f.forget(&b_record["id"], 1));
+    let content = canonical(&f.call("search", search()));
+    assert!(content.contains("visible task completed"));
+    assert!(!content.contains("DEPENDENT_derived-b"));
+    assert!(!content.contains("DEPENDENT_derived-c"));
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), raw_b.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_ok()
+    );
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), a["source_key"].as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+}
+#[test]
+fn source_revision_cancels_pending_aliases_without_tombstoning_recapture() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("revision-alias-a"));
+    f.store.maintain().unwrap();
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("revision-alias-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b.clone());
+
+    let mut revised_a = observe("revision-alias-a-new-operation");
+    revised_a["source_event"]["source_digest"] = json!("c".repeat(64));
+    revised_a["observation"]["payload"]["summary"] = json!("updated alias source");
+    f.call("observe", revised_a);
+    let old_a_replay = observe("revision-alias-a-old-replay");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_a_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), a["source_key"].as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), raw_b.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+
+    let mut old_replay = b.clone();
+    old_replay["idempotency_key"] = json!("old-alias-replay");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    b["idempotency_key"] = json!("new-alias-capture");
+    b["source_event"]["source_digest"] = json!("d".repeat(64));
+    b["observation"]["payload"]["summary"] = json!("updated dependent after revision");
+    f.store
+        .call(&principal("adapter"), "memory.observe", &b)
+        .unwrap();
+    while f.store.maintain().unwrap() {}
+    let content = canonical(&f.call("search", search()));
+    assert!(content.contains("updated alias source"));
+    assert!(content.contains("updated dependent after revision"));
+}
+#[test]
+fn blocked_observation_tombstones_its_raw_alias_chain() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("blocked-lineage-a"));
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&a["source_key"]));
+
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("blocked-lineage-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    assert_eq!(f.call("observe", b)["processing_state"], "deleted");
+    let mut c = dependent_observation("blocked-lineage-c", 11, &raw_b);
+    let raw_c = json!("c".repeat(64));
+    c["observation"]["payload"]["own_source_key"] = raw_c.clone();
+    assert_eq!(f.call("observe", c)["processing_state"], "deleted");
+
+    assert_eq!(f.call("search", search())["items"], json!([]));
+    while f.store.maintain().unwrap() {}
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_blocked-lineage-b"));
+    assert!(!content.contains("DEPENDENT_blocked-lineage-c"));
+    for alias in [&raw_b, &raw_c] {
+        assert!(
+            f.store
+                .db
+                .query_row(
+                    "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                    rusqlite::params![canonical(&scope()), alias.as_str().unwrap()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn blocked_source_arriving_after_its_child_clears_child_before_return() {
+    for process_child in [false, true] {
+        let f = Fixture::new();
+        let a = f.call("observe", observe("late-parent-a"));
+        f.store.maintain().unwrap();
+        f.call("observe", invalidation(&a["source_key"]));
+        let raw_b = json!("b".repeat(64));
+        let mut c = dependent_observation("early-child-c", 11, &raw_b);
+        c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+        let child = f.call("observe", c);
+        if process_child {
+            assert!(f.store.maintain().unwrap());
+        }
+        let mut b = dependent_observation("late-parent-b", 12, &a["source_key"]);
+        b["observation"]["payload"]["own_source_key"] = raw_b;
+        assert_eq!(f.call("observe", b)["processing_state"], "deleted");
+        assert_eq!(f.call("search", search())["items"], json!([]));
+        let payload: String = f
+            .store
+            .db
+            .query_row(
+                "SELECT payload FROM observations WHERE id=?",
+                [child["observation_id"].as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, "{}");
+        assert!(!f.store.maintain().unwrap());
+    }
+}
+
+#[test]
+fn manual_forget_preserves_historical_keyed_source_closure() {
+    let f = Fixture::new();
+    let original = json!("manual-original");
+    let replacement = json!("manual-replacement");
+    let mut args = save("manual-source");
+    args["sources"][0]["source_key"] = original.clone();
+    let saved = f.call("save", args);
+    f.call(
+        "observe",
+        dependent_observation("processed-old-source", 10, &original),
+    );
+    f.store.maintain().unwrap();
+    let mut correction = f.correct(&saved["id"]);
+    correction["sources"][0]["source_key"] = replacement.clone();
+    f.call("correct", correction);
+    f.call(
+        "observe",
+        dependent_observation("pending-new-source", 11, &replacement),
+    );
+    f.call("forget", f.forget(&saved["id"], 2));
+    assert_eq!(f.call("search", search())["items"], json!([]));
+    assert!(!f.store.maintain().unwrap());
+    for table in ["versions", "search_index"] {
+        let count: i64 = f
+            .store
+            .db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    let payloads: i64 = f
+        .store
+        .db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE payload!='{}'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(payloads, 0);
+}
+
+#[test]
+fn legacy_completed_payload_recovers_overwritten_dependency_on_invalidation() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("legacy-completed-a"));
+    f.store.maintain().unwrap();
+    let mut input = dependent_observation("legacy-completed-b", 12, &a["source_key"]);
+    input["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    input["observation"]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lineage_keys");
+    let b = f.call("observe", input);
+    f.store.maintain().unwrap();
+    let id: String = f
+        .store
+        .db
+        .query_row(
+            "SELECT record_id FROM observations WHERE id=?",
+            [b["observation_id"].as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Recreate v0.2.1's overwritten record sources/dependencies. The original
+    // observation payload is the only remaining evidence of explicit A -> B.
+    let mut record = f.call("get", f.get(&json!(id)))["item"].clone();
+    let mut old_source = source();
+    old_source["source_key"] = b["source_key"].clone();
+    record["sources"] = json!([old_source]);
+    let doc = canonical(&record);
+    f.store
+        .db
+        .execute(
+            "UPDATE records SET doc=? WHERE id=?",
+            rusqlite::params![doc, id],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE versions SET doc=? WHERE id=?",
+            rusqlite::params![doc, id],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute("DELETE FROM dependencies WHERE record_id=?", [&id])
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "INSERT INTO dependencies VALUES(?,?)",
+            rusqlite::params![id, b["source_key"].as_str()],
+        )
+        .unwrap();
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    reopened
+        .call(
+            &principal("adapter"),
+            "memory.observe",
+            &invalidation(&a["source_key"]),
+        )
+        .unwrap();
+    f.error("not_found", "get", f.get(&json!(id)));
+    assert_eq!(f.call("search", search())["items"], json!([]));
+}
+#[test]
+fn pending_source_revision_cancels_children_and_allows_new_digest() {
+    let f = Fixture::new();
+    let raw_a = json!("a".repeat(64));
+    let mut a_payload = observe("pending-revision-a");
+    a_payload["observation"]["payload"]["own_source_key"] = raw_a.clone();
+    let a = f.call("observe", a_payload.clone());
+    let mut b = dependent_observation("pending-revision-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = json!("b".repeat(64));
+    f.call("observe", b.clone());
+    let mut revised_a = a_payload.clone();
+    revised_a["idempotency_key"] = json!("pending-a-new-op");
+    revised_a["source_event"]["source_digest"] = json!("c".repeat(64));
+    revised_a["observation"]["payload"]["summary"] = json!("new A revision");
+    f.call("observe", revised_a);
+    let mut old_replay = a_payload.clone();
+    old_replay["idempotency_key"] = json!("pending-a-old-replay");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    let mut old_a_replay = a_payload.clone();
+    old_a_replay["idempotency_key"] = json!("pending-a-old-replay-new-op");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_a_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    let mut revised_b = b;
+    revised_b["idempotency_key"] = json!("pending-b-new-op");
+    revised_b["source_event"]["source_digest"] = json!("d".repeat(64));
+    f.store
+        .call(&principal("adapter"), "memory.observe", &revised_b)
+        .unwrap();
+    while f.store.maintain().unwrap() {}
+    let content = canonical(&f.call("search", search()));
+    assert!(content.contains("new A revision"));
+    assert!(content.contains("DEPENDENT_pending-revision-b"));
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), raw_a.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+}
+#[test]
+fn source_key_invalidation_is_scope_bound() {
+    let f = Fixture::new();
+    let source = "shared-source-key";
+    let other_scope = json!({"kind":"workspace","owner_id":"u","workspace_id":"other"});
+    let mut adapter = principal("adapter");
+    adapter["scopes"] = json!([scope(), other_scope.clone()]);
+    let mut a = observe("other-scope-observation");
+    a["scope"] = other_scope.clone();
+    a["source_event"]["workspace_id"] = json!("other");
+    a["observation"]["payload"]["sources"][0]["source_key"] = json!(source);
+    f.store.call(&adapter, "memory.observe", &a).unwrap();
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&json!(source)));
+    let mut model = principal("model");
+    model["scopes"] = json!([scope(), other_scope.clone()]);
+    let mut query = search();
+    query["scope"] = other_scope;
+    assert_eq!(
+        f.store.call(&model, "memory.search", &query).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+#[test]
+fn explicit_edges_work_after_restart_but_implicit_aggregate_edges_are_not_guessed() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("legacy-source-a"));
+    f.store.maintain().unwrap();
+
+    let mut explicit = observe("legacy-explicit-b");
+    explicit["source_event"]["source_seq"] = json!(10);
+    explicit["source_event"]["source_digest"] = json!("f".repeat(64));
+    explicit["observation"]["payload"]["summary"] = json!("EXPLICIT_DEPENDENT");
+    explicit["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    f.call("observe", explicit);
+
+    let mut implicit = observe("legacy-implicit-c");
+    implicit["source_event"]["source_seq"] = json!(11);
+    implicit["source_event"]["source_digest"] = json!("a".repeat(64));
+    implicit["observation"]["payload"]["summary"] = json!("UNRECOVERABLE_AGGREGATE");
+    f.call("observe", implicit);
+    while f.store.maintain().unwrap() {}
+
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    reopened
+        .call(
+            &principal("adapter"),
+            "memory.observe",
+            &invalidation(&a["source_key"]),
+        )
+        .unwrap();
+    assert!(!reopened.maintain().unwrap());
+    let result = reopened
+        .call(&principal("model"), "memory.search", &search())
+        .unwrap();
+    let content = canonical(&result);
+    assert!(!content.contains("EXPLICIT_DEPENDENT"));
+    assert!(content.contains("UNRECOVERABLE_AGGREGATE"));
 }
 #[test]
 fn closed_schema_and_redaction() {
@@ -616,4 +1504,101 @@ fn background_processing_failure_is_bounded_and_atomic() {
     assert_eq!(status["processing_state"], "failed");
     assert_eq!(status["error"], "processing_failed");
     assert!(!f.store.maintain().unwrap());
+}
+
+#[test]
+fn oversized_direct_store_save_and_correct_fail_before_mutation() {
+    let f = Fixture::new();
+    let mut too_large_save = save("oversized-save");
+    too_large_save["padding"] = json!("x".repeat(MAX_BODY + 1));
+    f.error("budget_exceeded", "save", too_large_save);
+    let count: i64 = f
+        .store
+        .db
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    let saved = f.call("save", save("before-correct"));
+    let mut too_large_correct = f.correct(&saved["id"]);
+    too_large_correct["padding"] = json!("x".repeat(MAX_BODY + 1));
+    f.error("budget_exceeded", "correct", too_large_correct);
+    assert_eq!(
+        f.call("get", f.get(&saved["id"]))["item"]["content"],
+        "运行项目测试 Rust preferences"
+    );
+}
+
+#[test]
+fn record_readability_guard_accounts_for_control_character_escaping() {
+    let record = json!({
+        "id":"large-control-record", "scope":scope(), "kind":"episode", "revision":1,
+        "status":"active", "content":"\u{0001}".repeat(MAX_BODY * 2), "sources":[]
+    });
+    assert_eq!(
+        ensure_record_readable(&record).unwrap_err().0,
+        "budget_exceeded"
+    );
+}
+
+#[test]
+fn record_readability_guard_accepts_maximum_compact_lineage_closure() {
+    let sources = (0..4096)
+        .map(|i| {
+            let key = format!("{i:064x}");
+            json!({"host":"tekes-memory-lineage","ref":key,"digest":key,"source_key":key})
+        })
+        .collect::<Vec<_>>();
+    let record = json!({
+        "id":"lineage-record", "scope":scope(), "kind":"episode", "revision":1,
+        "status":"active", "content":"bounded lineage", "sources":sources
+    });
+    ensure_record_readable(&record).unwrap();
+}
+
+#[test]
+fn request_and_response_json_decoders_have_independent_limits() {
+    let oversized = format!("null{}", " ".repeat(MAX_BODY));
+    assert_eq!(
+        decode(oversized.as_bytes()).unwrap_err().0,
+        "budget_exceeded"
+    );
+    assert_eq!(decode_response(oversized.as_bytes()).unwrap(), Value::Null);
+    let response_oversized = format!("null{}", " ".repeat(MAX_RESPONSE));
+    assert_eq!(
+        decode_response(response_oversized.as_bytes())
+            .unwrap_err()
+            .0,
+        "budget_exceeded"
+    );
+}
+
+#[test]
+fn oversized_derived_response_is_rejected_before_observation_enqueue() {
+    let f = Fixture::new();
+    let mut args = observe("oversized-derived-response");
+    args["observation"]["payload"]["lineage_keys"] = json!(
+        (0..4096)
+            .map(|i| format!("{}{i:04}", "\0".repeat(60)))
+            .collect::<Vec<_>>()
+    );
+    // A schema-valid request fits the input limit, while repeating its escaped
+    // lineage in the derived record would exceed the independent output limit.
+    validate(
+        &args,
+        tekes_memory::config::SCHEMAS.get("memory.observe").unwrap(),
+    )
+    .unwrap();
+    assert!(wire_json(&args).len() < MAX_BODY);
+    f.error("budget_exceeded", "observe", args);
+    for table in ["records", "observations", "jobs", "operations"] {
+        let count: i64 = f
+            .store
+            .db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
 }
