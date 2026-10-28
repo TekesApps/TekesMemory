@@ -967,12 +967,13 @@ fn blocked_observation_tombstones_its_raw_alias_chain() {
     let raw_b = json!("b".repeat(64));
     let mut b = dependent_observation("blocked-lineage-b", 10, &a["source_key"]);
     b["observation"]["payload"]["own_source_key"] = raw_b.clone();
-    f.call("observe", b);
+    assert_eq!(f.call("observe", b)["processing_state"], "deleted");
     let mut c = dependent_observation("blocked-lineage-c", 11, &raw_b);
     let raw_c = json!("c".repeat(64));
     c["observation"]["payload"]["own_source_key"] = raw_c.clone();
-    f.call("observe", c);
+    assert_eq!(f.call("observe", c)["processing_state"], "deleted");
 
+    assert_eq!(f.call("search", search())["items"], json!([]));
     while f.store.maintain().unwrap() {}
     let content = canonical(&f.call("search", search()));
     assert!(!content.contains("DEPENDENT_blocked-lineage-b"));
@@ -989,6 +990,150 @@ fn blocked_observation_tombstones_its_raw_alias_chain() {
                 .is_ok()
         );
     }
+}
+
+#[test]
+fn blocked_source_arriving_after_its_child_clears_child_before_return() {
+    for process_child in [false, true] {
+        let f = Fixture::new();
+        let a = f.call("observe", observe("late-parent-a"));
+        f.store.maintain().unwrap();
+        f.call("observe", invalidation(&a["source_key"]));
+        let raw_b = json!("b".repeat(64));
+        let mut c = dependent_observation("early-child-c", 11, &raw_b);
+        c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+        let child = f.call("observe", c);
+        if process_child {
+            assert!(f.store.maintain().unwrap());
+        }
+        let mut b = dependent_observation("late-parent-b", 12, &a["source_key"]);
+        b["observation"]["payload"]["own_source_key"] = raw_b;
+        assert_eq!(f.call("observe", b)["processing_state"], "deleted");
+        assert_eq!(f.call("search", search())["items"], json!([]));
+        let payload: String = f
+            .store
+            .db
+            .query_row(
+                "SELECT payload FROM observations WHERE id=?",
+                [child["observation_id"].as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, "{}");
+        assert!(!f.store.maintain().unwrap());
+    }
+}
+
+#[test]
+fn manual_forget_preserves_historical_keyed_source_closure() {
+    let f = Fixture::new();
+    let original = json!("manual-original");
+    let replacement = json!("manual-replacement");
+    let mut args = save("manual-source");
+    args["sources"][0]["source_key"] = original.clone();
+    let saved = f.call("save", args);
+    f.call(
+        "observe",
+        dependent_observation("processed-old-source", 10, &original),
+    );
+    f.store.maintain().unwrap();
+    let mut correction = f.correct(&saved["id"]);
+    correction["sources"][0]["source_key"] = replacement.clone();
+    f.call("correct", correction);
+    f.call(
+        "observe",
+        dependent_observation("pending-new-source", 11, &replacement),
+    );
+    f.call("forget", f.forget(&saved["id"], 2));
+    assert_eq!(f.call("search", search())["items"], json!([]));
+    assert!(!f.store.maintain().unwrap());
+    for table in ["versions", "search_index"] {
+        let count: i64 = f
+            .store
+            .db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    let payloads: i64 = f
+        .store
+        .db
+        .query_row(
+            "SELECT count(*) FROM observations WHERE payload!='{}'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(payloads, 0);
+}
+
+#[test]
+fn legacy_completed_payload_recovers_overwritten_dependency_on_invalidation() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("legacy-completed-a"));
+    f.store.maintain().unwrap();
+    let mut input = dependent_observation("legacy-completed-b", 12, &a["source_key"]);
+    input["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    input["observation"]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lineage_keys");
+    let b = f.call("observe", input);
+    f.store.maintain().unwrap();
+    let id: String = f
+        .store
+        .db
+        .query_row(
+            "SELECT record_id FROM observations WHERE id=?",
+            [b["observation_id"].as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Recreate v0.2.1's overwritten record sources/dependencies. The original
+    // observation payload is the only remaining evidence of explicit A -> B.
+    let mut record = f.call("get", f.get(&json!(id)))["item"].clone();
+    let mut old_source = source();
+    old_source["source_key"] = b["source_key"].clone();
+    record["sources"] = json!([old_source]);
+    let doc = canonical(&record);
+    f.store
+        .db
+        .execute(
+            "UPDATE records SET doc=? WHERE id=?",
+            rusqlite::params![doc, id],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE versions SET doc=? WHERE id=?",
+            rusqlite::params![doc, id],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute("DELETE FROM dependencies WHERE record_id=?", [&id])
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "INSERT INTO dependencies VALUES(?,?)",
+            rusqlite::params![id, b["source_key"].as_str()],
+        )
+        .unwrap();
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    reopened
+        .call(
+            &principal("adapter"),
+            "memory.observe",
+            &invalidation(&a["source_key"]),
+        )
+        .unwrap();
+    f.error("not_found", "get", f.get(&json!(id)));
+    assert_eq!(f.call("search", search())["items"], json!([]));
 }
 #[test]
 fn pending_source_revision_cancels_children_and_allows_new_digest() {

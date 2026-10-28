@@ -43,6 +43,11 @@ observation 的 summary/reason。scope、记录 ID、来源引用、事件身份
 
 后台任务每次在一个事务中整理一条情景，因此进程崩溃会提交全部或回滚全部，无跨进程任务租约。处理失败最多重试五次，指数间隔后成为 failed。turn_opened 和 source_invalidated 不生成多余情景正文。没有模型提炼器、自动候选晋升或技能安装器。
 
+派生 observation 保留上游 `lineage_keys` 与当前事件的 `own_source_key`，新服务与 adapter
+应配套升级。已永久失效的来源在接收事务内传播删除，返回 `accepted:true`、
+`processing_state:deleted`，不保留正文或待处理任务；正常来源修订允许同身份的新 digest
+重新采集。升级不会重建旧版已经丢失的聚合来源身份，详见 [来源设计](design/lineage-forget.md)。
+
 数据库 schema 版本为 1，更高版本拒绝写入。配置文件为 0600，数据目录为 0700。SQLite FULL 同步与单进程 flock 保护写入，FTS5 secure-delete 配合 SQLite secure_delete；[SQLite 的说明](https://www.sqlite.org/fts5.html#the_secure_delete_configuration_option)解释了两者的不同覆盖范围。服务不承诺擦除 APFS 快照、磁盘历史或外部备份。
 
 ## 来源与删除边界

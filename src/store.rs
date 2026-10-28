@@ -686,6 +686,12 @@ impl Store {
             if !seen.insert(key.clone()) {
                 continue;
             }
+            if block {
+                self.db.execute(
+                    "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                    params![scope, key],
+                )?;
+            }
             let rows = self.db.prepare(
                 "SELECT o.id,o.source_key,o.payload,j.state FROM observations o LEFT JOIN jobs j ON j.id=o.id WHERE o.scope=? AND o.payload!='{}'"
             )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
@@ -754,10 +760,18 @@ impl Store {
             {
                 continue;
             }
-            let own_keys = self.strings(
+            let mut own_keys = self.strings(
                 "SELECT source_key FROM observations WHERE scope=? AND record_id=?",
                 params![scope, id],
             )?;
+            // Explicitly saved records have no originating observation. Preserve
+            // their existing keyed-source closure, including historical sources.
+            if own_keys.is_empty() {
+                own_keys = self.strings(
+                    "SELECT source_key FROM dependencies WHERE record_id=?",
+                    [&id],
+                )?;
+            }
             for key in own_keys {
                 let invalidated = self.clear_lineage_dependents(scope, &key, block)?;
                 for invalidated_key in invalidated {
@@ -858,8 +872,24 @@ impl Store {
             identity[k] = event[k].clone()
         }
         let key = digest(&identity);
-        if !matches!(typ, "turn_opened" | "source_invalidated") {
+        let mut blocked = false;
+        if typ != "source_invalidated" {
             let record_args = derived_record_args(a["scope"].clone(), obs, &key)?;
+            for source in array(&record_args, "sources")? {
+                if let Some(source_key) = source["source_key"].as_str()
+                    && self
+                        .db
+                        .query_row(
+                            "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                            params![scope, source_key],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .is_some()
+                {
+                    blocked = true;
+                }
+            }
             let record = json!({
                 "id":"ffffffffffffffffffffffffffffffff",
                 "scope":record_args["scope"],"kind":record_args["kind"],
@@ -868,7 +898,9 @@ impl Store {
                 "observed_at":i64::MAX,"verified_at":i64::MAX,"pinned":true,
                 "expires_at":i64::MAX
             });
-            ensure_record_readable(&record)?;
+            if typ != "turn_opened" {
+                ensure_record_readable(&record)?;
+            }
         }
         let old:Option<(String,String,String)>=self.db.query_row("SELECT id,state,payload FROM observations WHERE scope=? AND source_key=? AND digest=?",params![scope,key,text(event,"source_digest")?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((id, state, payload)) = old {
@@ -936,6 +968,19 @@ impl Store {
             "INSERT INTO jobs VALUES(?,?,0,?,NULL)",
             params![id, state, (self.clock)()],
         )?;
+        let state = if blocked {
+            // Do not leave an already-invalid source queued until maintenance:
+            // a later child could otherwise publish first through its raw alias.
+            let invalidated = self.clear_lineage_dependents(&scope, &key, true)?;
+            let mut ids = Vec::new();
+            for source_key in invalidated {
+                ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?", params![scope, source_key])?);
+            }
+            self.erase(&scope, ids, true)?;
+            "deleted"
+        } else {
+            state
+        };
         Ok(json!({"accepted":true,"observation_id":id,"processing_state":state,"source_key":key}))
     }
     pub fn maintain(&self) -> Result<bool> {
