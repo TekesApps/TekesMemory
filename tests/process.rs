@@ -660,6 +660,29 @@ fn unsafe_endpoint_and_redirect_are_not_allowed() {
         assert!(tekes_memory::client::validate_endpoint(url).is_err())
     }
 }
+
+#[test]
+fn stdio_reports_unsupported_id_when_input_ends() {
+    let s = Service::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
+        .args(["stdio", "--endpoint", &s.url, "--credential-file"])
+        .arg(s.credential("model"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        r#"{{"jsonrpc":"2.0","id":9223372036854775808,"method":"ping"}}"#
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let error =
+        decode(&output.stdout).expect("unsupported ID must produce a protocol error before exit");
+    assert_eq!(error["id"], Value::Null);
+    assert_eq!(error["error"]["code"], -32600);
+}
 #[test]
 #[ignore = "requires MCP_SDK_ROOT and Node.js; runs official upstream SDK against Rust service"]
 fn official_typescript_sdk_interoperability() {

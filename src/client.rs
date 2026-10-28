@@ -409,7 +409,14 @@ pub async fn stdio(url: &str, token: &str) -> Result<()> {
             tokio::select! {
                 result = reader.read_until(b'\n', &mut line) => {
                     let count = result?;
-                    if count == 0 { break; }
+                    if count == 0 {
+                        // Invalid input can be followed immediately by EOF, before
+                        // the SDK starts a session. Deliver errors already queued.
+                        while let Ok(error) = error_receiver.try_recv() {
+                            stdout.write_all(error.as_bytes()).await?;
+                        }
+                        break;
+                    }
                     stdout.write_all(&line).await?;
                     line.clear();
                 }
@@ -425,11 +432,10 @@ pub async fn stdio(url: &str, token: &str) -> Result<()> {
         stdout.flush().await?;
         Ok::<(), std::io::Error>(())
     });
-    let service = relay
-        .serve((reader, relay_output))
-        .await
-        .map_err(|_| err("invalid_argument"))?;
-    let result = service.waiting().await.map_err(|_| err("unavailable"));
+    let result = match relay.serve((reader, relay_output)).await {
+        Ok(service) => service.waiting().await.map_err(|_| err("unavailable")),
+        Err(_) => Err(err("invalid_argument")),
+    };
     output_task.await.map_err(|_| err("unavailable"))??;
     remote.close().await;
     if let Ok(input) = input_result.try_recv() {
