@@ -46,8 +46,9 @@ macOS / Linux，Rust **1.95.0**（rust-toolchain.toml 固定），需要 C 编�
 ```sh
 cargo build --release --locked
 cargo test --locked
-cargo install --path . --locked --root /absolute/tekesmemory-v0.2.1
-/absolute/tekesmemory-v0.2.1/bin/tekes-memory --help
+cargo install --path . --locked --root /absolute/tekesmemory-v0.2.2
+/absolute/tekesmemory-v0.2.2/bin/tekes-memory --version
+/absolute/tekesmemory-v0.2.2/bin/tekes-memory --help
 ```
 
 Cargo.lock 固定依赖；生成 hook 前应先把二进制安装到固定版本目录。不要让生产 hook 指向会被开发构建覆盖的 target/debug。
@@ -90,6 +91,7 @@ init 输出的 `hook_templates` 中有五个 canonical JSON 文件，安装到�
 
 ## 文档
 
+- [0.2.2 发布与配套升级验证](docs/releases/v0.2.2.md)
 - [rmcp 迁移实施与验收](docs/design/rmcp-migration.md)
 - [运行契约](docs/contracts.md)
 - [安装、配置、升级与运维](docs/operations.md)
