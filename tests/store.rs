@@ -636,7 +636,7 @@ fn source_revision_invalidates_derived_text() {
     let mut b = observe("new");
     b["source_event"]["source_digest"] = json!("c".repeat(64));
     b["observation"]["payload"]["summary"] = json!("NEW_SOURCE");
-    f.call("observe", b);
+    f.call("observe", b.clone());
     f.store.maintain().unwrap();
     let r = f.call("search", search());
     assert_eq!(r["items"].as_array().unwrap().len(), 1);
@@ -677,6 +677,137 @@ fn invalidation_cancels_pending_job() {
     f.call("observe", invalidation(&a["source_key"]));
     assert!(!f.store.maintain().unwrap());
     assert_eq!(f.call("search", search())["items"], json!([]))
+}
+#[test]
+fn explicit_source_dependencies_are_preserved_and_invalidated() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("source-a"));
+    f.store.maintain().unwrap();
+    let mut b = observe("derived-b");
+    b["source_event"]["source_seq"] = json!(10);
+    b["source_event"]["source_digest"] = json!("f".repeat(64));
+    b["observation"]["payload"]["summary"] = json!("DEPENDENT_PRIVATE_TEXT");
+    b["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    f.call("observe", b.clone());
+    f.store.maintain().unwrap();
+    assert_eq!(
+        f.call("search", search())["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    f.call("observe", invalidation(&a["source_key"]));
+    assert_eq!(f.call("search", search())["items"], json!([]));
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    let mut replay = b.clone();
+    replay["idempotency_key"] = json!("event-replayed-under-new-operation");
+    assert_eq!(
+        reopened
+            .call(&principal("adapter"), "memory.observe", &replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    assert!(!reopened.maintain().unwrap());
+    assert_eq!(
+        reopened
+            .call(&principal("model"), "memory.search", &search())
+            .unwrap()["items"],
+        json!([])
+    );
+    assert_eq!(
+        f.store
+            .db
+            .query_row("SELECT count(*) FROM versions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.store
+            .db
+            .query_row("SELECT count(*) FROM search_index", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn invalidation_cancels_pending_explicit_dependents() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("source-a"));
+    f.store.maintain().unwrap();
+    let mut b = observe("derived-b");
+    b["source_event"]["source_seq"] = json!(10);
+    b["source_event"]["source_digest"] = json!("f".repeat(64));
+    b["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    f.call("observe", b);
+    f.call("observe", invalidation(&a["source_key"]));
+    while f.store.maintain().unwrap() {}
+    assert_eq!(f.call("search", search())["items"], json!([]));
+}
+#[test]
+fn source_key_invalidation_is_scope_bound() {
+    let f = Fixture::new();
+    let source = "shared-source-key";
+    let other_scope = json!({"kind":"workspace","owner_id":"u","workspace_id":"other"});
+    let mut adapter = principal("adapter");
+    adapter["scopes"] = json!([scope(), other_scope.clone()]);
+    let mut a = observe("other-scope-observation");
+    a["scope"] = other_scope.clone();
+    a["source_event"]["workspace_id"] = json!("other");
+    a["observation"]["payload"]["sources"][0]["source_key"] = json!(source);
+    f.store.call(&adapter, "memory.observe", &a).unwrap();
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&json!(source)));
+    let mut model = principal("model");
+    model["scopes"] = json!([scope(), other_scope.clone()]);
+    let mut query = search();
+    query["scope"] = other_scope;
+    assert_eq!(
+        f.store.call(&model, "memory.search", &query).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+#[test]
+fn legacy_explicit_edges_recover_but_implicit_aggregate_edges_do_not() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("legacy-source-a"));
+    f.store.maintain().unwrap();
+
+    let mut explicit = observe("legacy-explicit-b");
+    explicit["source_event"]["source_seq"] = json!(10);
+    explicit["source_event"]["source_digest"] = json!("f".repeat(64));
+    explicit["observation"]["payload"]["summary"] = json!("EXPLICIT_DEPENDENT");
+    explicit["observation"]["payload"]["sources"][0]["source_key"] = a["source_key"].clone();
+    f.call("observe", explicit);
+
+    let mut implicit = observe("legacy-implicit-c");
+    implicit["source_event"]["source_seq"] = json!(11);
+    implicit["source_event"]["source_digest"] = json!("a".repeat(64));
+    implicit["observation"]["payload"]["summary"] = json!("UNRECOVERABLE_AGGREGATE");
+    f.call("observe", implicit);
+    while f.store.maintain().unwrap() {}
+
+    let mut reopened = Store::open(&f._dir.path().join("memory.sqlite3"), 90).unwrap();
+    reopened.clock = || 1000;
+    reopened
+        .call(
+            &principal("adapter"),
+            "memory.observe",
+            &invalidation(&a["source_key"]),
+        )
+        .unwrap();
+    assert!(!reopened.maintain().unwrap());
+    let result = reopened
+        .call(&principal("model"), "memory.search", &search())
+        .unwrap();
+    let content = canonical(&result);
+    assert!(!content.contains("EXPLICIT_DEPENDENT"));
+    assert!(content.contains("UNRECOVERABLE_AGGREGATE"));
 }
 #[test]
 fn closed_schema_and_redaction() {

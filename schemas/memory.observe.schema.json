@@ -157,8 +157,13 @@
                 ],
                 "additionalProperties": false
               },
-              "maxItems": 64,
+              "maxItems": 4096,
               "minItems": 1
+            },
+            "lineage_keys": {
+              "type": "array",
+              "items": {"type":"string","minLength":1,"maxLength":64},
+              "maxItems": 4096
             },
             "outcome": {
               "type": "string",

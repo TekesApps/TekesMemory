@@ -69,6 +69,49 @@ fn real_http_store_restart_and_all_five_kernel_hooks() {
             .map(|r| r["id"].clone())
             .collect::<Vec<_>>(),
         ids
+    );
+    let items = s.search()["items"].as_array().unwrap().clone();
+    let tool = items
+        .iter()
+        .find(|item| {
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("AUDITLINEAGEMARKER")
+        })
+        .unwrap();
+    let turn = items.iter().find(|item| {
+        item["content"]
+            .as_str()
+            .unwrap()
+            .contains("AUDITLINEAGEMARKER")
+            && item["id"] != tool["id"]
+    });
+    assert!(turn.is_some(), "settled summary must retain tool output");
+    let result = s
+        .client("model")
+        .call(
+            "memory.forget",
+            json!({
+                "schema_version":1,
+                "scope":s.scope,
+                "ids":[tool["id"]],
+                "expected_revisions":[tool["revision"]],
+                "idempotency_key":"forget-tool-result"
+            }),
+        )
+        .unwrap();
+    assert_eq!(result["hidden"], true);
+    assert!(!canonical(&s.search()).contains("AUDITLINEAGEMARKER"));
+    assert_eq!(
+        s.client("model")
+            .call(
+                "memory.get",
+                json!({"schema_version":1,"scope":s.scope,"id":turn.unwrap()["id"]})
+            )
+            .unwrap_err()
+            .0,
+        "not_found"
     )
 }
 #[test]

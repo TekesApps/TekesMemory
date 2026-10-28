@@ -626,6 +626,27 @@ impl Store {
         self.db.execute("UPDATE jobs SET state='completed' WHERE id IN (SELECT id FROM observations WHERE scope=? AND source_key=?)",params![scope,key])?;
         Ok(())
     }
+    fn clear_pending_dependents(&self, scope: &str, key: &str) -> Result<()> {
+        let rows = self.db.prepare(
+            "SELECT o.id,o.payload FROM observations o JOIN jobs j ON j.id=o.id WHERE o.scope=? AND j.state IN ('accepted','failed')"
+        )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, payload) in rows {
+            let payload: Value = serde_json::from_str(&payload)?;
+            if payload["payload"]["sources"]
+                .as_array()
+                .is_some_and(|sources| sources.iter().any(|source| source["source_key"] == key))
+            {
+                self.db.execute(
+                    "UPDATE observations SET payload='{}',state='deleted' WHERE id=?",
+                    [&id],
+                )?;
+                self.db
+                    .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+            }
+        }
+        Ok(())
+    }
     fn erase(&self, scope: &str, ids: Vec<String>, block: bool) -> Result<usize> {
         let mut queue = ids;
         let mut seen = BTreeSet::new();
@@ -655,6 +676,7 @@ impl Store {
                         params![scope, key],
                     )?;
                 }
+                self.clear_pending_dependents(scope, &key)?;
                 queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![key,scope])?);
                 self.clear_source(scope, &key, "deleted")?;
             }
@@ -665,6 +687,14 @@ impl Store {
                 .execute("DELETE FROM dependencies WHERE record_id=?", [&id])?;
             self.db.execute(
                 "UPDATE records SET status='deleted',doc='{}' WHERE id=?",
+                [&id],
+            )?;
+            self.db.execute(
+                "UPDATE observations SET payload='{}',state='deleted' WHERE record_id=?",
+                [&id],
+            )?;
+            self.db.execute(
+                "UPDATE jobs SET state='completed' WHERE id IN (SELECT id FROM observations WHERE record_id=?)",
                 [&id],
             )?;
         }
@@ -775,6 +805,7 @@ impl Store {
                     "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
                     params![scope, target],
                 )?;
+                self.clear_pending_dependents(&scope, target)?;
                 let ids=self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,target])?;
                 self.erase(&scope, ids, true)?;
                 self.clear_source(&scope, target, "deleted")?;
@@ -837,9 +868,51 @@ impl Store {
                 job_id = Some(id.clone());
                 attempts = count;
                 let obs: Value = serde_json::from_str(&payload)?;
+                // Preserve caller supplied upstream dependencies and add the
+                // observation itself as a dependency of every derived record.
                 let mut sources = array(&obs["payload"], "sources")?.clone();
-                for s in &mut sources {
-                    s["source_key"] = json!(key)
+                if let Some(lineage) = obs["payload"]["lineage_keys"].as_array() {
+                    for source_key in lineage.iter().filter_map(Value::as_str) {
+                        if !sources.iter().any(|s| s["source_key"] == source_key) {
+                            sources.push(json!({
+                                "host":"tekes-memory-lineage",
+                                "ref":source_key,
+                                "digest":source_key,
+                                "source_key":source_key
+                            }));
+                        }
+                    }
+                }
+                if !sources.iter().any(|s| s["source_key"] == key) {
+                    sources.push(json!({
+                        "host":"tekes-memory",
+                        "ref":key,
+                        "digest":digest(&obs),
+                        "source_key":key
+                    }));
+                }
+                let mut blocked = false;
+                for source in &sources {
+                    if let Some(source_key) = source["source_key"].as_str()
+                        && self
+                            .db
+                            .query_row(
+                                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                                params![scope, source_key],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .optional()?
+                            .is_some()
+                    {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if blocked {
+                    self.clear_source(&scope, &key, "deleted")?;
+                    self.db
+                        .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+                    return Ok(());
                 }
                 let mut summary = obs["payload"].clone();
                 summary

@@ -323,8 +323,20 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
         evidence = vec![visible(last)]
     }
     let source_digest = digest(&json!(evidence));
-    let source =
-        json!({"host":"tekeskernel","ref":format!("{line}#seq={through}"),"digest":source_digest});
+    // Each visible ledger row gets an identity that is stable across derived
+    // observations. Invalidating a tool result can then invalidate a later
+    // turn summary that copied it.
+    let source_key = |row: &Value| {
+        digest(&json!({
+            "host":"tekeskernel",
+            "host_instance_id":c["host_instance_id"],
+            "workspace_id":r["workspace_id"],
+            "thread_id":r["thread_id"],
+            "line_id":line,
+            "source_seq":row["seq"]
+        }))
+    };
+    let source = json!({"host":"tekeskernel","ref":format!("{line}#seq={through}"),"digest":source_digest,"source_key":source_key(last)});
     let summary = canonical(&json!(evidence))
         .chars()
         .rev()
@@ -333,7 +345,14 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
         .chars()
         .rev()
         .collect::<String>();
-    let mut normalized = json!({"turn_id":turn,"summary":summary,"sources":[source]});
+    let mut lineage_keys = evidence.iter().map(source_key).collect::<Vec<_>>();
+    lineage_keys.sort();
+    lineage_keys.dedup();
+    if lineage_keys.len() > 4096 {
+        return Err(err("source_unavailable"));
+    }
+    let mut normalized =
+        json!({"turn_id":turn,"summary":summary,"sources":[source],"lineage_keys":lineage_keys});
     match event {
         "turn.settled" => {
             normalized["outcome"] = last["outcome"].clone();
