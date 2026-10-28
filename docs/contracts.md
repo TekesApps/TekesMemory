@@ -49,6 +49,10 @@ Kernel 扩展只读配置允许的 thread_root，规范化系统路径别名后�
 
 Kernel 成功回执可重放过去的 context；Memory 删除不会修改这个回执、宿主原始日志或实际请求资产。服务 TTL 与删除后重放防护也无法撤回此前已发送的内容。
 
+## 搜索索引与结果预算
+
+文档索引覆盖完整合法正文；查询分词最多保留 256 个不同 token。索引规则变更时，服务按 `search_index_version` 在现有数据库上重建 FTS 内容，不改数据库或记录 schema。搜索项保留 id、revision、kind、content、status、sources、verified_at 和 expires_at；当正文超出搜索预算时返回 query-centered excerpt 并标记 `content_truncated`。response `truncated` 表示正文有省略或仍有更多匹配项。`budget.utf8_bytes` 按最终序列化 `items` 与 `conflicts` 计费；完整记录始终可按 ID 用 `memory.get` 读取。
+
 ## 预算与兼容边界
 
 请求体至多 2MiB，查询最多 100 条，返回参考数据至多 32KiB。当前估算器为 UTF-8 字节上界，故 estimated_tokens=1500 可能明显少于 1500 个模型 token；不是准确 tokenizer。Kernel 扩展再检查最终包装文本上限。

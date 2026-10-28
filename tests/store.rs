@@ -89,6 +89,171 @@ fn restart_and_exact_retry() {
     changed["content"] = json!("different");
     f.error("idempotency_conflict", "save", changed)
 }
+
+#[test]
+fn search_finds_tokens_after_legacy_index_limit_for_new_and_corrected_records() {
+    let f = Fixture::new();
+    let english = (0..270)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " uniquetail";
+    let mut a = save("long-english");
+    a["content"] = json!(english);
+    let saved = f.call("save", a);
+    let mut q = search();
+    q["query"] = json!("uniquetail");
+    assert_eq!(
+        f.call("search", q.clone())["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let chinese = (0..270)
+        .map(|i| format!("中{i}词"))
+        .collect::<Vec<_>>()
+        .join("，")
+        + " 中文尾词独有";
+    let mut correction = f.correct(&saved["id"]);
+    correction["replacement"] = json!(chinese);
+    f.call("correct", correction);
+    q["query"] = json!("独有");
+    assert_eq!(f.call("search", q)["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn opening_legacy_index_rebuilds_full_document_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.sqlite3");
+    let store = Store::open(&path, 90).unwrap();
+    let f = Fixture {
+        _dir: tempfile::tempdir().unwrap(),
+        store,
+    };
+    let content = (0..270)
+        .map(|i| format!("old{i}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " migratedtail";
+    let mut a = save("legacy-reindex");
+    a["content"] = json!(content);
+    f.call("save", a);
+    let partial = tekes_memory::store::words(
+        &(" ".to_owned()
+            + &(0..270)
+                .map(|i| format!("old{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")),
+    )
+    .into_iter()
+    .take(256)
+    .collect::<Vec<_>>();
+    f.store
+        .db
+        .execute(
+            "UPDATE search_index SET words=? WHERE id=(SELECT id FROM records LIMIT 1)",
+            [partial.join(" ")],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute("DELETE FROM meta WHERE key='search_index_version'", [])
+        .unwrap();
+    drop(f);
+
+    let reopened = Store::open(&path, 90).unwrap();
+    let f = Fixture {
+        _dir: tempfile::tempdir().unwrap(),
+        store: reopened,
+    };
+    let mut q = search();
+    q["query"] = json!("migratedtail");
+    assert_eq!(f.call("search", q)["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn search_returns_budget_fitting_excerpt_and_get_keeps_full_record() {
+    let f = Fixture::new();
+    let content = "findme ".to_owned() + &"x".repeat(9000);
+    let mut a = save("large-search-hit");
+    a["content"] = json!(content);
+    let saved = f.call("save", a);
+    let mut q = search();
+    q["query"] = json!("findme");
+    q["budget"]["max_utf8_bytes"] = json!(8192);
+    q["budget"]["estimated_tokens"] = json!(8192);
+    let result = f.call("search", q);
+    let hit = &result["items"][0];
+    assert_eq!(hit["id"], saved["id"]);
+    assert_eq!(hit["scope"], scope());
+    assert_eq!(hit["sources"][0], source());
+    assert_eq!(hit["content_truncated"], true);
+    assert!(
+        canonical(&json!({"items":result["items"],"conflicts":result["conflicts"]})).len() <= 8192
+    );
+    assert_eq!(result["truncated"], true);
+    assert_eq!(
+        f.call("get", f.get(&saved["id"]))["item"]["content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        9007
+    );
+}
+
+#[test]
+fn search_skips_metadata_that_cannot_fit_and_continues_to_later_hits() {
+    let f = Fixture::new();
+    let mut huge = save("huge-source-metadata");
+    huge["content"] = json!("findme");
+    huge["sources"] = json!((0..64).map(|i| json!({"host":"test","ref":format!("{i}#{}", "🙂".repeat(4000)),"digest":"a".repeat(64)})).collect::<Vec<_>>());
+    let large = f.call("save", huge);
+    let mut small_input = save("small-hit");
+    small_input["content"] = json!("findme small-hit");
+    let small = f.call("save", small_input);
+    // Give equal-ranked matches deterministic ordering: metadata-only oversized
+    // hit first, then a normal hit that must still be returned.
+    f.store
+        .db
+        .execute(
+            "UPDATE records SET id='a-large' WHERE id=?",
+            [&large["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE search_index SET id='a-large' WHERE id=?",
+            [&large["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE records SET id='z-small' WHERE id=?",
+            [&small["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    f.store
+        .db
+        .execute(
+            "UPDATE search_index SET id='z-small' WHERE id=?",
+            [&small["id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let mut q = search();
+    q["query"] = json!("findme");
+    q["budget"]["max_utf8_bytes"] = json!(8192);
+    q["budget"]["estimated_tokens"] = json!(8192);
+    let result = f.call("search", q);
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    assert_eq!(result["items"][0]["content"], "findme small-hit");
+    assert_eq!(result["truncated"], true);
+    assert!(result["next_cursor"].is_null(), "{result}");
+    assert!(result["budget"]["utf8_bytes"].as_u64().unwrap() <= 8192);
+}
 #[test]
 fn kernel_effect_receipt_is_atomic_replayable_and_scope_bound() {
     let f = Fixture::new();

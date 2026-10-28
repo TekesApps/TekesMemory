@@ -90,6 +90,73 @@ fn adapter_continuation_reads_admitted_task() {
     )
 }
 #[test]
+fn default_adapter_retrieves_long_multibyte_summary_within_wrapped_budget() {
+    let s = Service::new();
+    let adapter = s.adapter_path();
+    let mut config = private_json(&adapter).unwrap();
+    config["retrieval"]["max_utf8_bytes"] = json!(8192);
+    config["retrieval"]["estimated_tokens"] = json!(8192);
+    std::fs::write(&adapter, canonical(&config)).unwrap();
+
+    let (path, mut rows) = s.ledger();
+    rows[1]["content"] = json!([{"type":"text","text":"ADAPTERLONGMARKER"}]);
+    rows[5]["content"] =
+        json!([{"type":"text","text":format!("ADAPTERLONGMARKER {}", "🙂".repeat(4500))}]);
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|v| format!("{}\n", canonical(v)))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let output = s.hook(
+        "turn.settled",
+        json!({"source_seq":7,"record":rows[6]}),
+        &path,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut indexed = false;
+    for _ in 0..100 {
+        indexed = s.search()["items"].as_array().unwrap().iter().any(|item| {
+            item["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ADAPTERLONGMARKER")
+        });
+        if indexed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(indexed, "long settled summary was not persisted");
+
+    let query = s.hook(
+        "context.prepare",
+        json!({"items":[{"role":"user","content":"ADAPTERLONGMARKER"}]}),
+        &path,
+    );
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let context = decode(&query.stdout).unwrap()["context"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(context.contains("ADAPTERLONGMARKER"));
+    assert!(
+        context.len() <= 8192,
+        "wrapped context was {} bytes",
+        context.len()
+    );
+}
+#[test]
 fn host_auth_origin_and_media_guards() {
     let s = Service::new();
     let http = reqwest::blocking::Client::builder()

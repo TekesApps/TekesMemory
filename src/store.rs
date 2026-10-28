@@ -45,6 +45,9 @@ fn scrub_write_args(name: &str, args: &Value) -> Value {
     safe
 }
 pub fn words(s: &str) -> Vec<String> {
+    words_limited(s, None)
+}
+fn words_limited(s: &str, limit: Option<usize>) -> Vec<String> {
     use std::sync::LazyLock;
     static WORD: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new("[a-z0-9_]+|[\\u{3400}-\\u{9fff}]+").unwrap());
@@ -61,13 +64,16 @@ pub fn words(s: &str) -> Vec<String> {
         for t in tokens {
             if seen.insert(t.clone()) {
                 out.push(t);
-                if out.len() == 256 {
+                if limit.is_some_and(|limit| out.len() == limit) {
                     return out;
                 }
             }
         }
     }
     out
+}
+fn query_words(s: &str) -> Vec<String> {
+    words_limited(s, Some(256))
 }
 impl Store {
     pub fn open(path: &Path, episode_days: i64) -> Result<Self> {
@@ -88,6 +94,41 @@ impl Store {
             [format!("{}{}", uid(), uid())],
         )?;
         db.execute("INSERT OR IGNORE INTO meta VALUES('generation','0')", [])?;
+        // The original indexer shared the 256-token query cap. Rebuild once on
+        // upgrade so existing records receive the complete document index.
+        let index_version: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='search_index_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if index_version.as_deref() != Some("2") {
+            db.execute_batch("BEGIN IMMEDIATE; DELETE FROM search_index;")?;
+            let docs = {
+                let mut stmt = db
+                    .prepare("SELECT id,doc FROM records WHERE status IN ('active','contested')")?;
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (id, doc) in docs {
+                let record: Value = serde_json::from_str(&doc)?;
+                db.execute(
+                    "INSERT INTO search_index VALUES(?,?)",
+                    params![
+                        id,
+                        words(&format!(
+                            "{} {}",
+                            record["content"].as_str().unwrap_or_default(),
+                            canonical(&record["fact"])
+                        ))
+                        .join(" ")
+                    ],
+                )?;
+            }
+            db.execute("INSERT INTO meta(key,value) VALUES('search_index_version','2') ON CONFLICT(key) DO UPDATE SET value='2'", [])?;
+            db.execute_batch("COMMIT")?;
+        }
         Ok(Self {
             db,
             episode_days,
@@ -322,6 +363,45 @@ impl Store {
             "active"
         }
         .into())
+    }
+    fn search_hit(mut record: Value, query: &str, available_bytes: usize) -> Option<Value> {
+        let original = record["content"].as_str()?.to_owned();
+        if canonical(&record).len() <= available_bytes {
+            return Some(record);
+        }
+
+        // Keep the matching passage when possible, then fit it to the remaining
+        // byte budget without cutting a UTF-8 code point.
+        let lowercase = original.to_lowercase();
+        let start = words(query)
+            .into_iter()
+            .find_map(|token| lowercase.find(&token))
+            .unwrap_or(0);
+        let start = original
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= start)
+            .last()
+            .unwrap_or(0);
+        let passage = &original[start..];
+        let mut low = 0usize;
+        let mut high = passage.chars().count();
+        let mut best = None;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let excerpt = passage.chars().take(mid).collect::<String>();
+            record["content"] = json!(excerpt);
+            record["content_truncated"] = json!(mid < original.chars().count());
+            if canonical(&record).len() <= available_bytes {
+                best = Some(record.clone());
+                low = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                high = mid - 1;
+            }
+        }
+        best
     }
     fn get(&self, a: &Value) -> Result<Value> {
         let mut r = self.row(&a["scope"], text(a, "id")?)?;
@@ -870,7 +950,7 @@ impl Store {
                 .map(|v| SqlValue::Text(v.as_str().unwrap().into())),
         );
         params.push(SqlValue::Integer((self.clock)()));
-        let tokens = words(text(a, "query")?);
+        let tokens = query_words(text(a, "query")?);
         let (base, order) = if tokens.is_empty() {
             ("SELECT doc FROM records WHERE ", "id")
         } else {
@@ -897,36 +977,37 @@ impl Store {
         )?;
         let mut items = vec![];
         let mut conflicts = vec![];
-        let mut used = 0;
         let mut consumed = 0;
+        let mut content_truncated = false;
         let cap = a["budget"]["max_utf8_bytes"]
             .as_u64()
             .unwrap()
             .min(a["budget"]["estimated_tokens"].as_u64().unwrap()) as usize;
+        let mut omitted_for_budget = false;
         for mut r in rows.clone() {
             if !self.valid(&r["fact"]) {
                 consumed += 1;
                 continue;
             }
             r["status"] = json!(self.current_status(&r)?);
-            let size = canonical(&r).len();
             if items.len() + conflicts.len() >= a["budget"]["max_items"].as_u64().unwrap() as usize
             {
                 break;
             }
-            if size > cap {
+            let contested = r["status"] == "contested";
+            let used = canonical(&json!({"items":items,"conflicts":conflicts})).len();
+            let remaining_record_bytes = cap.saturating_sub(used.saturating_add(1));
+            let Some(r) = Self::search_hit(r, text(a, "query")?, remaining_record_bytes) else {
+                omitted_for_budget = true;
                 consumed += 1;
                 continue;
-            }
-            if used + size > cap {
-                break;
-            }
-            if r["status"] == "contested" {
+            };
+            content_truncated |= r["content_truncated"] == true;
+            if contested {
                 conflicts.push(r)
             } else {
                 items.push(r)
             }
-            used += size;
             consumed += 1;
         }
         let more = consumed < rows.len() || rows.len() == 1001;
@@ -945,7 +1026,7 @@ impl Store {
             None
         };
         Ok(
-            json!({"items":items,"conflicts":conflicts,"next_cursor":cursor,"truncated":more,"budget":{"utf8_bytes":used,"estimator":"utf8-byte-upper-bound","max_bytes":cap}}),
+            json!({"items":items,"conflicts":conflicts,"next_cursor":cursor,"truncated":more || content_truncated || omitted_for_budget,"budget":{"utf8_bytes":canonical(&json!({"items":items,"conflicts":conflicts})).len(),"estimator":"utf8-byte-upper-bound","max_bytes":cap}}),
         )
     }
 }
