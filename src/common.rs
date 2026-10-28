@@ -13,6 +13,7 @@ use std::{
 };
 
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
+pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 pub const PROTOCOL: &str = "2025-11-25";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -52,6 +53,32 @@ pub fn now() -> i64 {
 }
 pub fn canonical(v: &Value) -> String {
     String::from_utf8(serde_json_canonicalizer::to_vec(v).expect("JSON serializes")).expect("UTF8")
+}
+pub fn wire_json(v: &Value) -> String {
+    serde_json::to_string(v).expect("JSON serializes")
+}
+pub fn supported_rpc_id(v: &Value) -> bool {
+    v.get("id")
+        .is_none_or(|id| id.as_i64().is_some() || id.as_str().is_some())
+}
+pub fn ensure_tool_result_readable(data: &Value) -> Result<()> {
+    let result = json!({
+        "structuredContent": data,
+        "content": [{"type":"text", "text":canonical(data)}],
+        "isError": false
+    });
+    let response = json!({"jsonrpc":"2.0","id":i64::MAX,"result":result});
+    if wire_json(&response).len() > MAX_RESPONSE {
+        return Err(err("budget_exceeded"));
+    }
+    Ok(())
+}
+pub fn ensure_record_readable(record: &Value) -> Result<()> {
+    ensure_tool_result_readable(&json!({
+        "schema_version":1,
+        "request_id":"00000000000000000000000000000000",
+        "item":record
+    }))
 }
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -129,7 +156,13 @@ impl<'de> Deserialize<'de> for Strict {
     }
 }
 pub fn decode(raw: &[u8]) -> Result<Value> {
-    if raw.len() > MAX_BODY {
+    decode_with_limit(raw, MAX_BODY)
+}
+pub fn decode_response(raw: &[u8]) -> Result<Value> {
+    decode_with_limit(raw, MAX_RESPONSE)
+}
+fn decode_with_limit(raw: &[u8], limit: usize) -> Result<Value> {
+    if raw.len() > limit {
         return Err(err("budget_exceeded"));
     }
     Ok(serde_json::from_slice::<Strict>(raw)?.0)

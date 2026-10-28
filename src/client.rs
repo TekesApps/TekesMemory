@@ -44,7 +44,7 @@ impl AsyncClient {
             .auth_header(token)
             .reinit_on_expired_session(false)
             .max_concurrent_requests(1)
-            .max_sse_event_size(MAX_BODY);
+            .max_sse_event_size(MAX_RESPONSE);
         config.retry_config = Arc::new(NoRetry);
         let transport = StreamableHttpClientTransport::with_client(http, config);
         let service = tokio::time::timeout(timeout, LocalClient.serve(transport))
@@ -326,8 +326,10 @@ fn relay_error(error: ServiceError) -> rmcp::ErrorData {
 }
 pub async fn stdio(url: &str, token: &str) -> Result<()> {
     use std::io::Read;
-    use tokio::io::AsyncWriteExt;
-    let (reader, mut writer) = tokio::io::duplex(MAX_BODY);
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (reader, mut writer) = tokio::io::duplex(MAX_RESPONSE);
+    let (relay_output, output_reader) = tokio::io::duplex(MAX_RESPONSE);
+    let (protocol_errors, mut error_receiver) = tokio::sync::mpsc::channel::<String>(16);
     let runtime = tokio::runtime::Handle::current();
     let (finished, mut input_result) = tokio::sync::oneshot::channel();
     let (first, first_input) = tokio::sync::oneshot::channel();
@@ -335,6 +337,7 @@ pub async fn stdio(url: &str, token: &str) -> Result<()> {
     // Process shutdown must not wait for a client that keeps stdin open.
     std::thread::spawn(move || {
         let mut first = Some(first);
+        let mut initialized = false;
         let result = (|| {
             let mut stdin = std::io::stdin().lock();
             let mut pending = Vec::new();
@@ -354,16 +357,30 @@ pub async fn stdio(url: &str, token: &str) -> Result<()> {
                     }
                     if *byte == b'\n' {
                         let mut request = decode(&pending)?;
-                        if first.is_some() {
+                        if !supported_rpc_id(&request) {
+                            runtime
+                                .block_on(protocol_errors.send(format!(
+                                    "{}\n",
+                                    wire_json(&json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Request id must be a signed 64-bit integer or string"}}))
+                                )))
+                                .map_err(|_| err("unavailable"))?;
+                            if let Some(sender) = first.take() {
+                                let _ = sender.send(Ok(true));
+                            }
+                            pending.clear();
+                            continue;
+                        }
+                        if !initialized {
                             if request["method"] != "initialize" {
                                 return Err(err("invalid_argument"));
                             }
+                            initialized = true;
                             if let Some(sender) = first.take() {
                                 let _ = sender.send(Ok(true));
                             }
                         }
                         crate::common::normalize_initialize(&mut request);
-                        let encoded = format!("{}\n", canonical(&request));
+                        let encoded = format!("{}\n", wire_json(&request));
                         runtime.block_on(writer.write_all(encoded.as_bytes()))?;
                         pending.clear();
                     }
@@ -383,11 +400,37 @@ pub async fn stdio(url: &str, token: &str) -> Result<()> {
     let relay = Relay {
         peer: remote.service.peer().clone(),
     };
+    let output_task = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(output_reader);
+        let mut stdout = tokio::io::stdout();
+        let mut line = Vec::new();
+        let mut errors_open = true;
+        loop {
+            tokio::select! {
+                result = reader.read_until(b'\n', &mut line) => {
+                    let count = result?;
+                    if count == 0 { break; }
+                    stdout.write_all(&line).await?;
+                    line.clear();
+                }
+                error = error_receiver.recv(), if errors_open => {
+                    if let Some(error) = error {
+                        stdout.write_all(error.as_bytes()).await?;
+                    } else {
+                        errors_open = false;
+                    }
+                }
+            }
+        }
+        stdout.flush().await?;
+        Ok::<(), std::io::Error>(())
+    });
     let service = relay
-        .serve((reader, tokio::io::stdout()))
+        .serve((reader, relay_output))
         .await
         .map_err(|_| err("invalid_argument"))?;
     let result = service.waiting().await.map_err(|_| err("unavailable"));
+    output_task.await.map_err(|_| err("unavailable"))??;
     remote.close().await;
     if let Ok(input) = input_result.try_recv() {
         input?;

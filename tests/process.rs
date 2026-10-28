@@ -470,12 +470,12 @@ fn stdio_is_a_native_rust_relay() {
             "initialize",
             json!({"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"contract-test","version":"1"}}),
         ),
-        (2, "tools/list", json!({})),
+        (9_007_199_254_740_993_i64, "tools/list", json!({})),
     ] {
         writeln!(
             input,
             "{}",
-            canonical(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            wire_json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         )
         .unwrap();
         input.flush().unwrap();
@@ -496,8 +496,158 @@ fn stdio_is_a_native_rust_relay() {
             assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 7)
         }
     }
+    for id in [
+        "9007199254740991",
+        "9007199254740992",
+        "9007199254740993",
+        "9223372036854775807",
+        "-9223372036854775808",
+    ] {
+        writeln!(input, r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#).unwrap();
+        input.flush().unwrap();
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert!(line.contains(&format!("\"id\":{id}")), "{line}");
+    }
+    input
+        .write_all(br#"{"jsonrpc":"2.0","id":"stdio-string-id","method":"ping"}"#)
+        .unwrap();
+    input.write_all(b"\n").unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert!(line.contains(r#""id":"stdio-string-id""#), "{line}");
+    input
+        .write_all(
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        )
+        .unwrap();
+    input.write_all(b"\n").unwrap();
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","id":987,"method":"ping"}))
+    )
+    .unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(decode(line.as_bytes()).unwrap()["id"], 987);
     drop(input);
     assert!(child.wait().unwrap().success())
+}
+
+#[test]
+fn stdio_returns_large_valid_saved_record() {
+    let s = Service::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
+        .args(["stdio", "--endpoint", &s.url, "--credential-file"])
+        .arg(s.credential("model"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"large","version":"1"}}}))).unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let initialized = decode(line.as_bytes()).unwrap();
+    assert_eq!(initialized["id"], 1);
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+    )
+    .unwrap();
+    let sources = (0..64)
+        .map(|_| json!({"host":"test","ref":"🙂".repeat(4096),"digest":"a".repeat(64)}))
+        .collect::<Vec<_>>();
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.save","arguments":{"schema_version":1,"scope":s.scope,"kind":"episode","content":"large stdio readback","sources":sources,"idempotency_key":"large-stdio"}}}))).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    let saved = decode_response(line.as_bytes()).unwrap();
+    assert_eq!(saved["id"], 2);
+    assert_eq!(saved["result"]["isError"], false);
+    let id = saved["result"]["structuredContent"]["id"].clone();
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.get","arguments":{"schema_version":1,"scope":s.scope,"id":id}}}))).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert!(
+        line.len() > MAX_BODY,
+        "response was only {} bytes",
+        line.len()
+    );
+    let loaded = decode_response(line.as_bytes()).unwrap();
+    assert_eq!(loaded["id"], 3);
+    assert_eq!(
+        loaded["result"]["structuredContent"]["item"]["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    drop(input);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn stdio_reports_unsupported_numeric_id_and_continues() {
+    let s = Service::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
+        .args(["stdio", "--endpoint", &s.url, "--credential-file"])
+        .arg(s.credential("model"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        input,
+        r#"{{"jsonrpc":"2.0","id":9223372036854775808,"method":"ping"}}"#
+    )
+    .unwrap();
+    input.flush().unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    let error = decode(line.as_bytes()).unwrap();
+    assert_eq!(error["id"], Value::Null);
+    assert_eq!(error["error"]["code"], -32600);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("signed 64-bit")
+    );
+
+    writeln!(input, "{}", wire_json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":PROTOCOL,"capabilities":{},"clientInfo":{"name":"after-invalid-id","version":"1"}}}))).unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(decode(line.as_bytes()).unwrap()["id"], 1);
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+    )
+    .unwrap();
+    writeln!(
+        input,
+        "{}",
+        wire_json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+    )
+    .unwrap();
+    input.flush().unwrap();
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(decode(line.as_bytes()).unwrap()["id"], 2);
+    drop(input);
+    assert!(child.wait().unwrap().success());
 }
 #[test]
 fn unsafe_endpoint_and_redirect_are_not_allowed() {

@@ -1125,3 +1125,70 @@ fn background_processing_failure_is_bounded_and_atomic() {
     assert_eq!(status["error"], "processing_failed");
     assert!(!f.store.maintain().unwrap());
 }
+
+#[test]
+fn oversized_direct_store_save_and_correct_fail_before_mutation() {
+    let f = Fixture::new();
+    let mut too_large_save = save("oversized-save");
+    too_large_save["padding"] = json!("x".repeat(MAX_BODY + 1));
+    f.error("budget_exceeded", "save", too_large_save);
+    let count: i64 = f
+        .store
+        .db
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    let saved = f.call("save", save("before-correct"));
+    let mut too_large_correct = f.correct(&saved["id"]);
+    too_large_correct["padding"] = json!("x".repeat(MAX_BODY + 1));
+    f.error("budget_exceeded", "correct", too_large_correct);
+    assert_eq!(
+        f.call("get", f.get(&saved["id"]))["item"]["content"],
+        "运行项目测试 Rust preferences"
+    );
+}
+
+#[test]
+fn record_readability_guard_accounts_for_control_character_escaping() {
+    let record = json!({
+        "id":"large-control-record", "scope":scope(), "kind":"episode", "revision":1,
+        "status":"active", "content":"\u{0001}".repeat(MAX_BODY * 2), "sources":[]
+    });
+    assert_eq!(
+        ensure_record_readable(&record).unwrap_err().0,
+        "budget_exceeded"
+    );
+}
+
+#[test]
+fn record_readability_guard_accepts_maximum_compact_lineage_closure() {
+    let sources = (0..4096)
+        .map(|i| {
+            let key = format!("{i:064x}");
+            json!({"host":"tekes-memory-lineage","ref":key,"digest":key,"source_key":key})
+        })
+        .collect::<Vec<_>>();
+    let record = json!({
+        "id":"lineage-record", "scope":scope(), "kind":"episode", "revision":1,
+        "status":"active", "content":"bounded lineage", "sources":sources
+    });
+    ensure_record_readable(&record).unwrap();
+}
+
+#[test]
+fn request_and_response_json_decoders_have_independent_limits() {
+    let oversized = format!("null{}", " ".repeat(MAX_BODY));
+    assert_eq!(
+        decode(oversized.as_bytes()).unwrap_err().0,
+        "budget_exceeded"
+    );
+    assert_eq!(decode_response(oversized.as_bytes()).unwrap(), Value::Null);
+    let response_oversized = format!("null{}", " ".repeat(MAX_RESPONSE));
+    assert_eq!(
+        decode_response(response_oversized.as_bytes())
+            .unwrap_err()
+            .0,
+        "budget_exceeded"
+    );
+}

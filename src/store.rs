@@ -44,6 +44,41 @@ fn scrub_write_args(name: &str, args: &Value) -> Value {
     }
     safe
 }
+fn derived_record_args(scope: Value, obs: &Value, key: &str) -> Result<Value> {
+    let mut sources = array(&obs["payload"], "sources")?.clone();
+    if let Some(lineage) = obs["payload"]["lineage_keys"].as_array() {
+        for source_key in lineage.iter().filter_map(Value::as_str) {
+            if !sources
+                .iter()
+                .any(|source| source["source_key"] == source_key)
+            {
+                sources.push(json!({
+                    "host":"tekes-memory-lineage",
+                    "ref":source_key,
+                    "digest":source_key,
+                    "source_key":source_key
+                }));
+            }
+        }
+    }
+    if !sources.iter().any(|source| source["source_key"] == key) {
+        sources.push(json!({
+            "host":"tekes-memory",
+            "ref":key,
+            "digest":digest(obs),
+            "source_key":key
+        }));
+    }
+    let mut summary = obs["payload"].clone();
+    let payload = summary
+        .as_object_mut()
+        .ok_or_else(|| err("invalid_argument"))?;
+    payload.remove("sources");
+    payload.remove("lineage_keys");
+    summary["observation"] = obs["type"].clone();
+    let content = canonical(&summary).chars().take(32768).collect::<String>();
+    Ok(json!({"scope":scope,"kind":"episode","content":content,"sources":sources}))
+}
 pub fn words(s: &str) -> Vec<String> {
     words_limited(s, None)
 }
@@ -204,6 +239,9 @@ impl Store {
             || (name == "memory.observe" && p["role"] != "adapter")
         {
             return Err(err("scope_denied"));
+        }
+        if wire_json(a).len() > MAX_BODY {
+            return Err(err("budget_exceeded"));
         }
         validate(a, SCHEMAS.get(name).ok_or_else(|| err("invalid_argument"))?)?;
         if let Some(scope) = a.get("scope") {
@@ -424,9 +462,11 @@ impl Store {
                 return Err(err("not_found"));
             }
         }
+        ensure_record_readable(&r)?;
         Ok(json!({"item":r}))
     }
     fn put(&self, r: &Value) -> Result<()> {
+        ensure_record_readable(r)?;
         let id = text(r, "id")?;
         let doc = canonical(r);
         self.db.execute(
@@ -795,6 +835,18 @@ impl Store {
             identity[k] = event[k].clone()
         }
         let key = digest(&identity);
+        if !matches!(typ, "turn_opened" | "source_invalidated") {
+            let record_args = derived_record_args(a["scope"].clone(), obs, &key)?;
+            let record = json!({
+                "id":"ffffffffffffffffffffffffffffffff",
+                "scope":record_args["scope"],"kind":record_args["kind"],
+                "revision":i64::MAX,"status":"contested",
+                "content":record_args["content"],"sources":record_args["sources"],
+                "observed_at":i64::MAX,"verified_at":i64::MAX,"pinned":true,
+                "expires_at":i64::MAX
+            });
+            ensure_record_readable(&record)?;
+        }
         let old:Option<(String,String,String)>=self.db.query_row("SELECT id,state,payload FROM observations WHERE scope=? AND source_key=? AND digest=?",params![scope,key,text(event,"source_digest")?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((id, state, payload)) = old {
             if !matches!(state.as_str(), "deleted" | "expired") && payload != canonical(obs) {
@@ -892,31 +944,9 @@ impl Store {
                 job_id = Some(id.clone());
                 attempts = count;
                 let obs: Value = serde_json::from_str(&payload)?;
-                // Preserve caller supplied upstream dependencies and add the
-                // observation itself as a dependency of every derived record.
-                let mut sources = array(&obs["payload"], "sources")?.clone();
-                if let Some(lineage) = obs["payload"]["lineage_keys"].as_array() {
-                    for source_key in lineage.iter().filter_map(Value::as_str) {
-                        if !sources.iter().any(|s| s["source_key"] == source_key) {
-                            sources.push(json!({
-                                "host":"tekes-memory-lineage",
-                                "ref":source_key,
-                                "digest":source_key,
-                                "source_key":source_key
-                            }));
-                        }
-                    }
-                }
-                if !sources.iter().any(|s| s["source_key"] == key) {
-                    sources.push(json!({
-                        "host":"tekes-memory",
-                        "ref":key,
-                        "digest":digest(&obs),
-                        "source_key":key
-                    }));
-                }
+                let record_args = derived_record_args(serde_json::from_str(&scope)?, &obs, &key)?;
                 let mut blocked = false;
-                for source in &sources {
+                for source in array(&record_args, "sources")? {
                     if let Some(source_key) = source["source_key"].as_str()
                         && self
                             .db
@@ -938,18 +968,7 @@ impl Store {
                         .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
                     return Ok(());
                 }
-                let mut summary = obs["payload"].clone();
-                summary
-                    .as_object_mut()
-                    .ok_or_else(|| err("invalid_argument"))?
-                    .remove("sources");
-                summary
-                    .as_object_mut()
-                    .ok_or_else(|| err("invalid_argument"))?
-                    .remove("lineage_keys");
-                summary["observation"] = obs["type"].clone();
-                let content = canonical(&summary).chars().take(32768).collect::<String>();
-                let saved=self.save(&json!({"scope":serde_json::from_str::<Value>(&scope)?,"kind":"episode","content":content,"sources":sources}))?;
+                let saved = self.save(&record_args)?;
                 self.db.execute(
                     "UPDATE observations SET state='completed',record_id=? WHERE id=?",
                     params![text(&saved, "id")?, id],

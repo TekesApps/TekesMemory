@@ -86,6 +86,136 @@ fn negotiation_and_invalid_initialize_keep_json_contract() {
 }
 
 #[test]
+fn http_preserves_signed_integer_rpc_ids_and_rejects_unsupported_numbers() {
+    let s = Service::new();
+    let wire = Wire::new(&s);
+    for id in [
+        "9007199254740991",
+        "9007199254740992",
+        "9007199254740993",
+        "9223372036854775807",
+        "-9223372036854775808",
+    ] {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+        let response = wire
+            .http
+            .post(&s.url)
+            .bearer_auth(s.token("model"))
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", PROTOCOL)
+            .header("MCP-Session-Id", &wire.session)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let text = response.text().unwrap();
+        assert!(text.contains(&format!("\"id\":{id}")), "{text}");
+    }
+    let string_id = wire
+        .http
+        .post(&s.url)
+        .bearer_auth(s.token("model"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", PROTOCOL)
+        .header("MCP-Session-Id", &wire.session)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":"string-id","method":"ping"}"#)
+        .send()
+        .unwrap();
+    assert_eq!(string_id.status(), 200);
+    assert!(string_id.text().unwrap().contains(r#""id":"string-id""#));
+    let notification = wire
+        .http
+        .post(&s.url)
+        .bearer_auth(s.token("model"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", PROTOCOL)
+        .header("MCP-Session-Id", &wire.session)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#)
+        .send()
+        .unwrap();
+    assert_eq!(notification.status(), 202);
+    assert!(notification.bytes().unwrap().is_empty());
+    let after_notification = wire
+        .http
+        .post(&s.url)
+        .bearer_auth(s.token("model"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", PROTOCOL)
+        .header("MCP-Session-Id", &wire.session)
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","id":987,"method":"ping"}"#)
+        .send()
+        .unwrap();
+    assert_eq!(after_notification.status(), 200);
+    assert_eq!(after_notification.json::<Value>().unwrap()["id"], 987);
+    let body = r#"{"jsonrpc":"2.0","id":9223372036854775808,"method":"ping"}"#;
+    let response = wire
+        .http
+        .post(&s.url)
+        .bearer_auth(s.token("model"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", PROTOCOL)
+        .header("MCP-Session-Id", &wire.session)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let error = response.json::<Value>().unwrap();
+    assert_eq!(error["error"]["code"], -32600);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("signed 64-bit")
+    );
+}
+
+#[test]
+fn large_valid_saved_record_remains_readable_over_http() {
+    let s = Service::new();
+    let wire = Wire::new(&s);
+    let sources = (0..64)
+        .map(|_| {
+            json!({
+                "host":"test", "ref":"🙂".repeat(4096),
+                "digest":"a".repeat(64)
+            })
+        })
+        .collect::<Vec<_>>();
+    let saved = wire.rpc(
+        "memory.save",
+        json!({
+            "schema_version":1,"scope":s.scope,"kind":"episode","content":"large readback",
+            "sources":sources,"idempotency_key":"large-readback"
+        }),
+    );
+    assert_eq!(saved["isError"], false);
+    let response = wire.post("model", json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{
+        "name":"memory.get","arguments":{"schema_version":1,"scope":s.scope,"id":saved["structuredContent"]["id"]}
+    }}));
+    assert_eq!(response.status(), 200);
+    let bytes = response.bytes().unwrap();
+    assert!(
+        bytes.len() > MAX_BODY,
+        "response was only {} bytes",
+        bytes.len()
+    );
+    let decoded = decode_response(&bytes).unwrap();
+    assert_eq!(decoded["result"]["isError"], false);
+    assert_eq!(
+        decoded["result"]["structuredContent"]["item"]["sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+}
+
+#[test]
 fn stdio_effects_use_http_owner_and_relay_exit_keeps_service_alive() {
     let s = Service::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tekes-memory"))
