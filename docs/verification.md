@@ -1,3 +1,8 @@
+# Issue #3–#9 修复验收（2026-10-29）
+
+最终集成验证与逐项证据见 [修复验收记录](verification/fix-issues-3-9.md)：83 项集成测试、
+2 项官方 SDK HTTP/stdio 测试、Clippy 和格式检查通过；升级限制与审计提示在该记录中明确列出。
+
 # rmcp 迁移验证（2026-10-13）
 
 平台：macOS arm64；`rustc 1.95.0 (59807616e 2026-04-14)`；官方 `rmcp =3.5.1`，发布来源和 features 见 [实施文档](design/rmcp-migration.md)。所有结果针对最后源码，包括 SDK recovery、SSE retry 和 reqwest 自身 retry 均禁用的版本。

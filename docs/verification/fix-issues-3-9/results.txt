@@ -1,0 +1,26 @@
+final-tests.log:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.49s
+     Running unittests src/lib.rs (target/debug/deps/tekes_memory-02ed5c1311e450f7)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/main.rs (target/debug/deps/tekes_memory-eb39b8cdd9e288aa)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/process.rs (target/debug/deps/process-0d22731c1c6b9f5c)
+test result: ok. 14 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.89s
+     Running tests/store.rs (target/debug/deps/store-9607c4c0cfd68baa)
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.81s
+     Running tests/transport_contract.rs (target/debug/deps/transport_contract-bec05b40b1ea5dba)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.01s
+     Running unittests examples/benchmark.rs (target/debug/examples/benchmark-eb41cc3f8eb01be3)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/deployment_smoke.rs (target/debug/examples/deployment_smoke-f2f45f196a71a643)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests examples/kernel_fixture.rs (target/debug/examples/kernel_fixture-ebe8f5064bf4cdc7)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+final-sdk.log:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running tests/process.rs (target/debug/deps/process-0d22731c1c6b9f5c)
+official SDK stdio initialize/list/save/get/search/close: passed
+official SDK HTTP initialize/list/save/get/search/close: passed
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.80s
+final-clippy.log:
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.38s

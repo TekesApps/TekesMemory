@@ -30,3 +30,6 @@
 其余工作继续推进。只有原验收条件全部有证据支持的 Issue 才能关闭。
 
 最终实现、命令、结果和未验证项将回填到各 Issue 与批次验收记录。
+
+最终结果见 [逐项验收记录](../verification/fix-issues-3-9.md) 与
+[PR #10](https://github.com/TekesApps/TekesMemory/pull/10)。
