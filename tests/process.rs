@@ -74,17 +74,15 @@ fn real_http_store_restart_and_all_five_kernel_hooks() {
     let tool = items
         .iter()
         .find(|item| {
-            item["content"]
-                .as_str()
-                .unwrap()
-                .contains("AUDITLINEAGEMARKER")
+            let content = item["content"].as_str().unwrap();
+            content.contains("AUDITLINEAGEMARKER")
+                && content.contains("\"observation\":\"tool_result\"")
         })
         .unwrap();
     let turn = items.iter().find(|item| {
-        item["content"]
-            .as_str()
-            .unwrap()
-            .contains("AUDITLINEAGEMARKER")
+        let content = item["content"].as_str().unwrap();
+        content.contains("AUDITLINEAGEMARKER")
+            && content.contains("\"observation\":\"turn_outcome\"")
             && item["id"] != tool["id"]
     });
     assert!(turn.is_some(), "settled summary must retain tool output");
@@ -102,7 +100,12 @@ fn real_http_store_restart_and_all_five_kernel_hooks() {
         )
         .unwrap();
     assert_eq!(result["hidden"], true);
-    assert!(!canonical(&s.search()).contains("AUDITLINEAGEMARKER"));
+    let after_forget = s.search();
+    assert!(
+        !canonical(&after_forget).contains("AUDITLINEAGEMARKER"),
+        "remaining lineage records: {}",
+        canonical(&after_forget)
+    );
     assert_eq!(
         s.client("model")
             .call(

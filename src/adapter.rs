@@ -351,8 +351,13 @@ pub fn handle(c: &Value, r: &Value) -> Result<Value> {
     if lineage_keys.len() > 4096 {
         return Err(err("source_unavailable"));
     }
-    let mut normalized =
-        json!({"turn_id":turn,"summary":summary,"sources":[source],"lineage_keys":lineage_keys});
+    let mut normalized = json!({
+        "turn_id":turn,
+        "summary":summary,
+        "sources":[source],
+        "own_source_key":source_key(last),
+        "lineage_keys":lineage_keys
+    });
     match event {
         "turn.settled" => {
             normalized["outcome"] = last["outcome"].clone();

@@ -751,6 +751,8 @@ fn dependent_observation(key: &str, seq: u64, dependency: &Value) -> Value {
     child["source_event"]["source_seq"] = json!(seq);
     child["source_event"]["source_digest"] = json!(format!("{:064x}", seq));
     child["observation"]["payload"]["summary"] = json!(format!("DEPENDENT_{key}"));
+    child["observation"]["payload"]["own_source_key"] =
+        json!(digest(&json!({"test-own-source":key})));
     child["observation"]["payload"]["lineage_keys"] = json!([dependency]);
     child
 }
@@ -760,8 +762,12 @@ fn source_invalidation_cancels_transitive_pending_lineage_keys() {
     let a = f.call("observe", observe("chain-a"));
     f.store.maintain().unwrap();
     let b = dependent_observation("chain-b", 10, &a["source_key"]);
-    let b_key = f.call("observe", b)["source_key"].clone();
-    let c = dependent_observation("chain-c", 11, &b_key);
+    let raw_b = json!("b".repeat(64));
+    let mut b = b;
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    let mut c = dependent_observation("chain-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
     let c_key = f.call("observe", c.clone())["source_key"].clone();
     f.store.maintain().unwrap();
     f.call("observe", invalidation(&a["source_key"]));
@@ -798,14 +804,243 @@ fn forgetting_source_cancels_transitive_pending_lineage_keys() {
     f.store.maintain().unwrap();
     let a_record = f.call("search", search())["items"][0].clone();
     let b = dependent_observation("chain-b", 10, &a["source_key"]);
-    let b_key = f.call("observe", b)["source_key"].clone();
-    let c = dependent_observation("chain-c", 11, &b_key);
+    let raw_b = json!("b".repeat(64));
+    let mut b = b;
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    let mut c = dependent_observation("chain-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
     f.call("observe", c);
     f.call("forget", f.forget(&a_record["id"], 1));
     assert!(!f.store.maintain().unwrap());
     let content = canonical(&f.call("search", search()));
     assert!(!content.contains("DEPENDENT_chain-b"));
     assert!(!content.contains("DEPENDENT_chain-c"));
+}
+#[test]
+fn invalidation_cancels_processed_alias_dependents() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("processed-alias-a"));
+    f.store.maintain().unwrap();
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("processed-alias-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    f.store.maintain().unwrap();
+    let mut c = dependent_observation("processed-alias-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+    f.call("observe", c);
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&a["source_key"]));
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_processed-alias-b"));
+    assert!(!content.contains("DEPENDENT_processed-alias-c"));
+    let mut replay = observe("processed-alias-a-new-digest");
+    replay["source_event"]["source_digest"] = json!("c".repeat(64));
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &replay)
+            .unwrap_err()
+            .0,
+        "source_unavailable"
+    );
+}
+#[test]
+fn forgetting_derived_record_blocks_its_alias_without_tombstoning_upstream() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("upstream-a"));
+    f.store.maintain().unwrap();
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("derived-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    f.store.maintain().unwrap();
+    let b_record = f.call("search", search())["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["content"]
+                .as_str()
+                .unwrap()
+                .contains("DEPENDENT_derived-b")
+        })
+        .unwrap()
+        .clone();
+    let mut c = dependent_observation("derived-c", 11, &raw_b);
+    c["observation"]["payload"]["own_source_key"] = json!("c".repeat(64));
+    f.call("observe", c);
+    f.call("forget", f.forget(&b_record["id"], 1));
+    let content = canonical(&f.call("search", search()));
+    assert!(content.contains("visible task completed"));
+    assert!(!content.contains("DEPENDENT_derived-b"));
+    assert!(!content.contains("DEPENDENT_derived-c"));
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), raw_b.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_ok()
+    );
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), a["source_key"].as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+}
+#[test]
+fn source_revision_cancels_pending_aliases_without_tombstoning_recapture() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("revision-alias-a"));
+    f.store.maintain().unwrap();
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("revision-alias-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b.clone());
+
+    let mut revised_a = observe("revision-alias-a-new-operation");
+    revised_a["source_event"]["source_digest"] = json!("c".repeat(64));
+    revised_a["observation"]["payload"]["summary"] = json!("updated alias source");
+    f.call("observe", revised_a);
+    let old_a_replay = observe("revision-alias-a-old-replay");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_a_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), a["source_key"].as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), raw_b.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
+
+    let mut old_replay = b.clone();
+    old_replay["idempotency_key"] = json!("old-alias-replay");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    b["idempotency_key"] = json!("new-alias-capture");
+    b["source_event"]["source_digest"] = json!("d".repeat(64));
+    b["observation"]["payload"]["summary"] = json!("updated dependent after revision");
+    f.store
+        .call(&principal("adapter"), "memory.observe", &b)
+        .unwrap();
+    while f.store.maintain().unwrap() {}
+    let content = canonical(&f.call("search", search()));
+    assert!(content.contains("updated alias source"));
+    assert!(content.contains("updated dependent after revision"));
+}
+#[test]
+fn blocked_observation_tombstones_its_raw_alias_chain() {
+    let f = Fixture::new();
+    let a = f.call("observe", observe("blocked-lineage-a"));
+    f.store.maintain().unwrap();
+    f.call("observe", invalidation(&a["source_key"]));
+
+    let raw_b = json!("b".repeat(64));
+    let mut b = dependent_observation("blocked-lineage-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = raw_b.clone();
+    f.call("observe", b);
+    let mut c = dependent_observation("blocked-lineage-c", 11, &raw_b);
+    let raw_c = json!("c".repeat(64));
+    c["observation"]["payload"]["own_source_key"] = raw_c.clone();
+    f.call("observe", c);
+
+    while f.store.maintain().unwrap() {}
+    let content = canonical(&f.call("search", search()));
+    assert!(!content.contains("DEPENDENT_blocked-lineage-b"));
+    assert!(!content.contains("DEPENDENT_blocked-lineage-c"));
+    for alias in [&raw_b, &raw_c] {
+        assert!(
+            f.store
+                .db
+                .query_row(
+                    "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                    rusqlite::params![canonical(&scope()), alias.as_str().unwrap()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .is_ok()
+        );
+    }
+}
+#[test]
+fn pending_source_revision_cancels_children_and_allows_new_digest() {
+    let f = Fixture::new();
+    let raw_a = json!("a".repeat(64));
+    let mut a_payload = observe("pending-revision-a");
+    a_payload["observation"]["payload"]["own_source_key"] = raw_a.clone();
+    let a = f.call("observe", a_payload.clone());
+    let mut b = dependent_observation("pending-revision-b", 10, &a["source_key"]);
+    b["observation"]["payload"]["own_source_key"] = json!("b".repeat(64));
+    f.call("observe", b.clone());
+    let mut revised_a = a_payload.clone();
+    revised_a["idempotency_key"] = json!("pending-a-new-op");
+    revised_a["source_event"]["source_digest"] = json!("c".repeat(64));
+    revised_a["observation"]["payload"]["summary"] = json!("new A revision");
+    f.call("observe", revised_a);
+    let mut old_replay = a_payload.clone();
+    old_replay["idempotency_key"] = json!("pending-a-old-replay");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    let mut old_a_replay = a_payload.clone();
+    old_a_replay["idempotency_key"] = json!("pending-a-old-replay-new-op");
+    assert_eq!(
+        f.store
+            .call(&principal("adapter"), "memory.observe", &old_a_replay)
+            .unwrap()["processing_state"],
+        "deleted"
+    );
+    let mut revised_b = b;
+    revised_b["idempotency_key"] = json!("pending-b-new-op");
+    revised_b["source_event"]["source_digest"] = json!("d".repeat(64));
+    f.store
+        .call(&principal("adapter"), "memory.observe", &revised_b)
+        .unwrap();
+    while f.store.maintain().unwrap() {}
+    let content = canonical(&f.call("search", search()));
+    assert!(content.contains("new A revision"));
+    assert!(content.contains("DEPENDENT_pending-revision-b"));
+    assert!(
+        f.store
+            .db
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                rusqlite::params![canonical(&scope()), raw_a.as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err()
+    );
 }
 #[test]
 fn source_key_invalidation_is_scope_bound() {

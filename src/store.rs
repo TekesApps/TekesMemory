@@ -46,6 +46,18 @@ fn scrub_write_args(name: &str, args: &Value) -> Value {
 }
 fn derived_record_args(scope: Value, obs: &Value, key: &str) -> Result<Value> {
     let mut sources = array(&obs["payload"], "sources")?.clone();
+    if let Some(source_key) = obs["payload"]["own_source_key"].as_str()
+        && !sources
+            .iter()
+            .any(|source| source["source_key"] == source_key)
+    {
+        sources.push(json!({
+            "host":"tekes-memory-lineage",
+            "ref":source_key,
+            "digest":source_key,
+            "source_key":source_key
+        }));
+    }
     if let Some(lineage) = obs["payload"]["lineage_keys"].as_array() {
         for source_key in lineage.iter().filter_map(Value::as_str) {
             if !sources
@@ -74,6 +86,7 @@ fn derived_record_args(scope: Value, obs: &Value, key: &str) -> Result<Value> {
         .as_object_mut()
         .ok_or_else(|| err("invalid_argument"))?;
     payload.remove("sources");
+    payload.remove("own_source_key");
     payload.remove("lineage_keys");
     summary["observation"] = obs["type"].clone();
     let content = canonical(&summary).chars().take(32768).collect::<String>();
@@ -666,7 +679,7 @@ impl Store {
         self.db.execute("UPDATE jobs SET state='completed' WHERE id IN (SELECT id FROM observations WHERE scope=? AND source_key=?)",params![scope,key])?;
         Ok(())
     }
-    fn clear_pending_dependents(&self, scope: &str, key: &str) -> Result<Vec<String>> {
+    fn clear_lineage_dependents(&self, scope: &str, key: &str, block: bool) -> Result<Vec<String>> {
         let mut queue = vec![key.to_owned()];
         let mut seen = BTreeSet::new();
         while let Some(key) = queue.pop() {
@@ -674,32 +687,49 @@ impl Store {
                 continue;
             }
             let rows = self.db.prepare(
-                "SELECT o.id,o.source_key,o.payload FROM observations o JOIN jobs j ON j.id=o.id WHERE o.scope=? AND j.state IN ('accepted','failed')"
-            )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                "SELECT o.id,o.source_key,o.payload,j.state FROM observations o LEFT JOIN jobs j ON j.id=o.id WHERE o.scope=? AND o.payload!='{}'"
+            )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (id, own_key, payload) in rows {
+            for (id, own_key, payload, job_state) in rows {
                 let payload: Value = serde_json::from_str(&payload)?;
-                let depends_on_key =
-                    payload["payload"]["sources"]
+                let depends_on_key = own_key == key
+                    || payload["payload"]["own_source_key"] == key
+                    || payload["payload"]["sources"]
                         .as_array()
                         .is_some_and(|sources| {
                             sources.iter().any(|source| source["source_key"] == key)
                         })
-                        || payload["payload"]["lineage_keys"]
-                            .as_array()
-                            .is_some_and(|keys| keys.iter().any(|source_key| source_key == &key));
+                    || payload["payload"]["lineage_keys"]
+                        .as_array()
+                        .is_some_and(|keys| keys.iter().any(|source_key| source_key == &key));
                 if depends_on_key {
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
-                        params![scope, own_key],
-                    )?;
+                    let aliases = payload["payload"]["own_source_key"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    if block {
+                        for alias in &aliases {
+                            self.db.execute(
+                                "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                                params![scope, alias],
+                            )?;
+                        }
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
+                            params![scope, own_key],
+                        )?;
+                    }
                     self.db.execute(
                         "UPDATE observations SET payload='{}',state='deleted' WHERE id=?",
                         [&id],
                     )?;
-                    self.db
-                        .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+                    if job_state.is_some() {
+                        self.db
+                            .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+                    }
                     queue.push(own_key);
+                    queue.extend(aliases);
                 }
             }
         }
@@ -724,22 +754,15 @@ impl Store {
             {
                 continue;
             }
-            for key in self.strings(
-                "SELECT source_key FROM dependencies WHERE record_id=?",
-                [&id],
-            )? {
-                if block {
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
-                        params![scope, key],
-                    )?;
-                }
-                let invalidated = self.clear_pending_dependents(scope, &key)?;
+            let own_keys = self.strings(
+                "SELECT source_key FROM observations WHERE scope=? AND record_id=?",
+                params![scope, id],
+            )?;
+            for key in own_keys {
+                let invalidated = self.clear_lineage_dependents(scope, &key, block)?;
                 for invalidated_key in invalidated {
                     queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![invalidated_key,scope])?);
                 }
-                queue.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE d.source_key=? AND r.scope=?",params![key,scope])?);
-                self.clear_source(scope, &key, "deleted")?;
             }
             self.db.execute("DELETE FROM versions WHERE id=?", [&id])?;
             self.db
@@ -869,6 +892,11 @@ impl Store {
             return Err(err("source_unavailable"));
         }
         let previous=self.strings("SELECT record_id FROM observations WHERE scope=? AND source_key=? AND record_id IS NOT NULL",params![scope,key])?;
+        let invalidated = self.clear_lineage_dependents(&scope, &key, false)?;
+        let mut previous = previous;
+        for invalidated_key in invalidated {
+            previous.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+        }
         self.erase(&scope, previous, false)?;
         self.clear_source(&scope, &key, "deleted")?;
         if typ == "source_invalidated" {
@@ -878,7 +906,7 @@ impl Store {
                     "INSERT OR IGNORE INTO tombstones VALUES(?,?)",
                     params![scope, target],
                 )?;
-                let invalidated = self.clear_pending_dependents(&scope, target)?;
+                let invalidated = self.clear_lineage_dependents(&scope, target, true)?;
                 let mut ids = Vec::new();
                 for invalidated_key in invalidated {
                     ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
@@ -963,9 +991,12 @@ impl Store {
                     }
                 }
                 if blocked {
-                    self.clear_source(&scope, &key, "deleted")?;
-                    self.db
-                        .execute("UPDATE jobs SET state='completed' WHERE id=?", [&id])?;
+                    let invalidated = self.clear_lineage_dependents(&scope, &key, true)?;
+                    let mut dependent_ids = Vec::new();
+                    for invalidated_key in invalidated {
+                        dependent_ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+                    }
+                    self.erase(&scope, dependent_ids, true)?;
                     return Ok(());
                 }
                 let saved = self.save(&record_args)?;
