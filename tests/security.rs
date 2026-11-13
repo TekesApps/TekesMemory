@@ -331,7 +331,7 @@ fn queued_observation_rechecks_policy_and_copies_opaque_content() {
         .unwrap();
     assert!(!raw.contains("v1.AAAA"));
     drop(store);
-    let store = f.open();
+    let mut store = f.open();
     f.control(json!({"deny":["derive"]}));
     assert_eq!(store.maintain().unwrap_err().0, "security_denied");
     assert_eq!(
@@ -342,6 +342,7 @@ fn queued_observation_rechecks_policy_and_copies_opaque_content() {
         0
     );
     f.control(json!({}));
+    store.clock = || 1001;
     assert!(store.maintain().unwrap());
     let result = store.call(&p(), "memory.search", &search()).unwrap();
     assert_eq!(result["items"][0]["content"], content());
@@ -726,5 +727,172 @@ fn maintenance_denials_and_migration_failure_are_independently_audited() {
     for action in ["rewrap", "migrate"] {
         let n:i64=audit.query_row("SELECT count(*) FROM audit WHERE json_extract(event,'$.operation')=? AND json_extract(event,'$.outcome')='denied_or_failed'",[action],|r|r.get(0)).unwrap();
         assert_eq!(n, 2, "{action}");
+    }
+}
+
+#[test]
+fn protected_rejected_job_does_not_starve_another_scope() {
+    let f = Fixture::new();
+    let mut store = f.open();
+    let mut a = observation("a");
+    a["observation"]["payload"]["sources"][0]["source_key"] = json!("a");
+    let accepted_a = store.call(&p(), "memory.observe", &a).unwrap();
+    store.clock = || 1001;
+    let mut b = observation("b");
+    b["scope"]["workspace_id"] = json!("w-b");
+    b["source_event"]["workspace_id"] = json!("w-b");
+    b["observation"]["payload"]["sources"][0]["source_key"] = json!("b");
+    let mut other_principal = p();
+    other_principal["scopes"] = json!([b["scope"]]);
+    let accepted_b = store.call(&other_principal, "memory.observe", &b).unwrap();
+    f.control(json!({"revoked_sources":["a"]}));
+    assert_eq!(store.maintain().unwrap_err().0, "security_denied");
+    assert!(
+        store
+            .maintain()
+            .expect("a denied job must not monopolize maintenance")
+    );
+    let state = |id: &Value| -> String {
+        store
+            .db
+            .query_row(
+                "SELECT state FROM observations WHERE id=?",
+                [id.as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(state(&accepted_a["observation_id"]), "accepted");
+    assert_eq!(state(&accepted_b["observation_id"]), "completed");
+    assert_eq!(
+        store
+            .db
+            .query_row(
+                "SELECT count(*) FROM records WHERE scope=?",
+                [canonical(&scope())],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    let retry: (i64, i64, String) = store
+        .db
+        .query_row(
+            "SELECT attempts,next_at,error FROM jobs WHERE id=?",
+            [accepted_a["observation_id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retry, (0, 1002, "security_denied".into()));
+    drop(store);
+    let mut store = f.open();
+    store.clock = || 1002;
+    f.control(json!({}));
+    assert!(store.maintain().unwrap());
+    let state: (String, Option<String>) = store
+        .db
+        .query_row(
+            "SELECT state,error FROM jobs WHERE id=?",
+            [accepted_a["observation_id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("completed".into(), None));
+}
+
+#[test]
+fn protected_rejected_job_does_not_rollback_expiry() {
+    let f = Fixture::new();
+    let mut store = f.open();
+    f.control(json!({"deadline":1002}));
+    let saved = store.call(&p(), "memory.save", &save("expires")).unwrap();
+    let mut a = observation("a");
+    a["observation"]["payload"]["sources"][0]["source_key"] = json!("a");
+    store.call(&p(), "memory.observe", &a).unwrap();
+    let generation = store.security_status().unwrap()["generation"]
+        .as_i64()
+        .unwrap();
+    store.clock = || 1003;
+    f.control(json!({"revoked_sources":["a"]}));
+    assert_eq!(store.maintain().unwrap_err().0, "security_denied");
+    let row: (String, String) = store
+        .db
+        .query_row(
+            "SELECT status,doc FROM records WHERE id=?",
+            [saved["id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("expired".into(), "{}".into()));
+    for table in ["versions", "search_index"] {
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE id=?"),
+                    [saved["id"].as_str().unwrap()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        store.security_status().unwrap()["generation"],
+        generation + 1
+    );
+    let audits: i64 = store.db.query_row("SELECT count(*) FROM security_audit WHERE json_extract(event,'$.operation')='maintenance' AND json_extract(event,'$.outcome')='denied_or_failed'", [], |r| r.get(0)).unwrap();
+    assert!(audits > 0);
+    drop(store);
+    f.open(); // Committed expiry/retry bookkeeping agrees with the independent watermark.
+}
+
+#[test]
+fn protected_deferred_job_bookkeeping_requires_audit_and_checkpoint() {
+    for fail_audit in [true, false] {
+        let f = Fixture::new();
+        let mut store = f.open();
+        f.control(json!({"deadline":1002}));
+        let saved = store.call(&p(), "memory.save", &save("expires")).unwrap();
+        let mut a = observation("a");
+        a["observation"]["payload"]["sources"][0]["source_key"] = json!("a");
+        let accepted = store.call(&p(), "memory.observe", &a).unwrap();
+        let generation = store.security_status().unwrap()["generation"].clone();
+        store.clock = || 1003;
+        f.control(json!({"revoked_sources":["a"],"lose_reserve_response":!fail_audit}));
+        if fail_audit {
+            store.db.execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON security_audit BEGIN SELECT RAISE(FAIL,'synthetic audit write failure'); END;").unwrap();
+        }
+        assert_eq!(
+            store.maintain().unwrap_err().0,
+            if fail_audit {
+                "storage_error"
+            } else {
+                "security_unavailable"
+            }
+        );
+        let status: String = store
+            .db
+            .query_row(
+                "SELECT status FROM records WHERE id=?",
+                [saved["id"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active", "uncommitted expiry must roll back");
+        let retry: (i64, Option<String>) = store
+            .db
+            .query_row(
+                "SELECT next_at,error FROM jobs WHERE id=?",
+                [accepted["observation_id"].as_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry, (1000, None), "uncommitted scheduling must roll back");
+        assert_eq!(store.security_status().unwrap()["generation"], generation);
+        if !fail_audit {
+            f.control(json!({}));
+            assert_eq!(store.maintain().unwrap_err().0, "security_restore_required");
+        }
     }
 }

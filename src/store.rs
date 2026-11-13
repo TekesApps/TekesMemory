@@ -1671,19 +1671,24 @@ impl Store {
         Ok(json!({"accepted":true,"observation_id":id,"processing_state":state,"source_key":key}))
     }
     pub fn maintain(&self) -> Result<bool> {
-        let result = self.maintain_inner();
-        if result.is_err() {
-            self.audit(
-                &json!({"id":"maintenance"}),
-                "maintenance",
-                &Value::Null,
-                "denied_or_failed",
-                None,
-            )?;
+        match self.maintain_inner() {
+            // A deferred protected job was rolled back and durably audited together
+            // with retry scheduling/expiry. Preserve its failure for the caller.
+            Ok((_, Some(error))) => Err(error),
+            Ok((worked, None)) => Ok(worked),
+            Err(error) => {
+                self.audit(
+                    &json!({"id":"maintenance"}),
+                    "maintenance",
+                    &Value::Null,
+                    "denied_or_failed",
+                    None,
+                )?;
+                Err(error)
+            }
         }
-        result
     }
-    fn maintain_inner(&self) -> Result<bool> {
+    fn maintain_inner(&self) -> Result<(bool, Option<Error>)> {
         self.deliver_audit()?;
         self.checkpoint("check")?;
         self.access(
@@ -1695,6 +1700,7 @@ impl Store {
         self.begin()?;
         let mut job_id = None;
         let mut attempts = 0;
+        let mut deferred_failure = None;
         let result = (|| {
             let now = (self.clock)();
             let expired = self.docs(
@@ -1724,50 +1730,70 @@ impl Store {
             if let Some((id, count, scope, payload, key)) = job {
                 job_id = Some(id.clone());
                 attempts = count;
-                let obs = self.decode_stored(&payload, Some(&json!({"table":"observation","id":id,"scope":serde_json::from_str::<Value>(&scope)?})))?;
-                let record_args = self.derived_args(serde_json::from_str(&scope)?, &obs, &key)?;
-                let mut blocked = false;
-                for source in array(&record_args, "sources")? {
-                    if let Some(source_key) = source["source_key"].as_str()
-                        && self
-                            .db
-                            .query_row(
-                                "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
-                                params![scope, source_key],
-                                |r| r.get::<_, i64>(0),
-                            )
-                            .optional()?
-                            .is_some()
-                    {
-                        blocked = true;
-                        break;
+                self.db.execute_batch("SAVEPOINT maintenance_job")?;
+                let job_result: Result<()> = (|| {
+                    let obs = self.decode_stored(&payload, Some(&json!({"table":"observation","id":id,"scope":serde_json::from_str::<Value>(&scope)?})))?;
+                    let record_args =
+                        self.derived_args(serde_json::from_str(&scope)?, &obs, &key)?;
+                    let mut blocked = false;
+                    for source in array(&record_args, "sources")? {
+                        if let Some(source_key) = source["source_key"].as_str()
+                            && self
+                                .db
+                                .query_row(
+                                    "SELECT 1 FROM tombstones WHERE scope=? AND source_key=?",
+                                    params![scope, source_key],
+                                    |r| r.get::<_, i64>(0),
+                                )
+                                .optional()?
+                                .is_some()
+                        {
+                            blocked = true;
+                            break;
+                        }
                     }
-                }
-                if blocked {
-                    let invalidated = self.clear_lineage_dependents(&scope, &key, true)?;
-                    let mut dependent_ids = Vec::new();
-                    for invalidated_key in invalidated {
-                        dependent_ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+                    if blocked {
+                        let invalidated = self.clear_lineage_dependents(&scope, &key, true)?;
+                        let mut dependent_ids = Vec::new();
+                        for invalidated_key in invalidated {
+                            dependent_ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
+                        }
+                        self.erase(&scope, dependent_ids, true)?;
+                        return Ok(());
                     }
-                    self.erase(&scope, dependent_ids, true)?;
-                    self.bump()?;
-                    return Ok(());
+                    self.access(
+                        &json!({"id":"maintenance","role":"system"}),
+                        "derive",
+                        &record_args["scope"],
+                        &record_args,
+                    )?;
+                    let saved = self.save(&record_args)?;
+                    self.db.execute(
+                        "UPDATE observations SET state='completed',record_id=? WHERE id=?",
+                        params![text(&saved, "id")?, id],
+                    )?;
+                    self.db.execute(
+                        "UPDATE jobs SET state='completed',attempts=attempts+1,error=NULL WHERE id=?",
+                        [&id],
+                    )?;
+                    Ok(())
+                })();
+                match job_result {
+                    Ok(()) => self.db.execute_batch("RELEASE maintenance_job")?,
+                    Err(error) if self.security.is_some() => {
+                        self.db.execute_batch(
+                            "ROLLBACK TO maintenance_job; RELEASE maintenance_job",
+                        )?;
+                        // Recheck policy later without spending the ordinary terminal retry
+                        // budget. Moving this job behind other due jobs prevents starvation.
+                        self.db.execute(
+                            "UPDATE jobs SET next_at=?,error=? WHERE id=?",
+                            params![now + 1, error.0, id],
+                        )?;
+                        deferred_failure = Some(error);
+                    }
+                    Err(error) => return Err(error),
                 }
-                self.access(
-                    &json!({"id":"maintenance","role":"system"}),
-                    "derive",
-                    &record_args["scope"],
-                    &record_args,
-                )?;
-                let saved = self.save(&record_args)?;
-                self.db.execute(
-                    "UPDATE observations SET state='completed',record_id=? WHERE id=?",
-                    params![text(&saved, "id")?, id],
-                )?;
-                self.db.execute(
-                    "UPDATE jobs SET state='completed',attempts=attempts+1,error=NULL WHERE id=?",
-                    [id],
-                )?;
             }
             if job_id.is_some() || !expired.is_empty() {
                 self.bump()?
@@ -1782,7 +1808,11 @@ impl Store {
                             &json!({"id":"maintenance"}),
                             "maintenance",
                             &Value::Null,
-                            "success",
+                            if deferred_failure.is_some() {
+                                "denied_or_failed"
+                            } else {
+                                "success"
+                            },
                             None,
                         )?;
                     }
@@ -1807,7 +1837,7 @@ impl Store {
             }
         }
         self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-        Ok(job_id.is_some())
+        Ok((job_id.is_some(), deferred_failure))
     }
     fn search(&self, p: &Value, a: &Value) -> Result<Value> {
         let mut scopes = vec![a["scope"].clone()];
