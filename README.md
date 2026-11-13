@@ -51,6 +51,9 @@ cargo install --path . --locked --root /absolute/tekesmemory-v0.2.2
 /absolute/tekesmemory-v0.2.2/bin/tekes-memory --help
 ```
 
+常规安全集成测试还需要 Python 3 与 `cryptography`（合成 AES-GCM provider，无外部模型调用）。默认使用 `python3`；可指定已有虚拟环境：`MEMORY_TEST_PYTHON=/absolute/venv/bin/python cargo test --locked`。先在该解释器中确认 `import cryptography` 成功；不需要修改全局 Python。
+
+
 Cargo.lock 固定依赖；生成 hook 前应先把二进制安装到固定版本目录。不要让生产 hook 指向会被开发构建覆盖的 target/debug。
 
 ## 隔离演示

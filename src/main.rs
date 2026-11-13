@@ -33,6 +33,15 @@ enum Command {
         #[arg(long)]
         ready_file: Option<PathBuf>,
     },
+    SecurityMaintenance {
+        #[arg(long)]
+        config: PathBuf,
+        /// Explicitly migrate a legacy client-encrypted Store in one transaction.
+        #[arg(long)]
+        migrate_opaque: bool,
+        #[arg(long, default_value_t = 64)]
+        max_rows: usize,
+    },
     Kernel {
         #[arg(long)]
         config: PathBuf,
@@ -87,6 +96,46 @@ fn run(a: Args) -> Result<()> {
             .enable_all()
             .build()?
             .block_on(tekes_memory::server::serve(&config, ready_file.as_deref())),
+        Command::SecurityMaintenance {
+            config: path,
+            migrate_opaque,
+            max_rows,
+        } => {
+            use fs2::FileExt;
+            use std::os::unix::fs::OpenOptionsExt;
+            let config = config::service_config(&path)?;
+            let provider = config
+                .get("security_provider")
+                .ok_or_else(|| err("security_provider_required"))?;
+            let directory = PathBuf::from(text(&config, "data_directory")?);
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(directory.join("service.lock"))?;
+            lock.try_lock_exclusive()
+                .map_err(|_| err("service_already_running"))?;
+            let database = directory.join("memory.sqlite3");
+            let days = config["episode_days"].as_i64().unwrap();
+            let store = if migrate_opaque {
+                tekes_memory::store::Store::migrate_opaque(&database, days, provider)?
+            } else {
+                tekes_memory::store::Store::open_secure(&database, days, Some(provider))?
+            };
+            let migrated = if migrate_opaque {
+                0
+            } else {
+                store.rewrap_batch(max_rows)?
+            };
+            store.deliver_audit()?;
+            let mut status = store.security_status()?;
+            status["rows_rewrapped"] = serde_json::json!(migrated);
+            status["opaque_migrated"] = serde_json::json!(migrate_opaque);
+            print(&status)
+        }
         Command::Kernel { config: path } => {
             let config = config::adapter_config(&path)?;
             let mut raw = vec![];

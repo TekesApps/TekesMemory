@@ -532,35 +532,7 @@ fn client_does_not_replay_ambiguous_mutations_on_stale_session_or_timeout() {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(50)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let mut chunk = [0; 4096];
-                let body_start = loop {
-                    let Ok(n) = stream.read(&mut chunk) else {
-                        break None;
-                    };
-                    if n == 0 {
-                        break None;
-                    }
-                    bytes.extend_from_slice(&chunk[..n]);
-                    if let Some(at) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..at]);
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length: ")
-                                    .and_then(|n| n.parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if bytes.len() >= at + 4 + length {
-                            break Some(at + 4);
-                        }
-                    }
-                };
-                let Some(at) = body_start else {
+                let Ok((bytes, at)) = read_mock_http_request(&mut stream) else {
                     continue;
                 };
                 let request: Value = serde_json::from_slice(&bytes[at..]).unwrap_or(Value::Null);
@@ -722,35 +694,9 @@ fn client_drop_waits_for_bounded_session_delete_ack() {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             };
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut chunk = [0; 4096];
-            let body_start = loop {
-                let Ok(n) = stream.read(&mut chunk) else {
-                    break None;
-                };
-                if n == 0 {
-                    break None;
-                }
-                bytes.extend_from_slice(&chunk[..n]);
-                if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..at]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .and_then(|v| v.parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= at + 4 + length {
-                        break Some(at + 4);
-                    }
-                }
+            let Ok((bytes, at)) = read_mock_http_request(&mut stream) else {
+                continue;
             };
-            let Some(at) = body_start else { continue };
             let delete = bytes.starts_with(b"DELETE ");
             let request: Value = serde_json::from_slice(&bytes[at..]).unwrap_or(Value::Null);
             let (status, body) = if delete {
@@ -801,4 +747,54 @@ fn client_drop_waits_for_bounded_session_delete_ack() {
         1,
         "close must not replay DELETE"
     );
+}
+
+// Shared by the bounded-lifecycle mocks: read a complete Content-Length frame.
+fn read_mock_http_request(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, usize)> {
+    // macOS inherits O_NONBLOCK from the listener; a read timeout does not clear it.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let length = String::from_utf8_lossy(&bytes[..at])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|n| n.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= at + 4 + length {
+                return Ok((bytes, at + 4));
+            }
+        }
+    }
+}
+
+#[test]
+fn mock_http_reader_waits_for_fragmented_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    writer
+        .write_all(b"POST /mcp HTTP/1.1\r\nContent-Length: 2\r\n\r\n")
+        .unwrap();
+    let (mut reader, _) = listener.accept().unwrap();
+    // Reproduce macOS accept inheritance on platforms that do not inherit it.
+    reader.set_nonblocking(true).unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        writer.write_all(b"{}").unwrap();
+    });
+    let read = read_mock_http_request(&mut reader);
+    writer.join().unwrap();
+    let (bytes, at) = read.expect("accepted sockets must wait for the remaining request bytes");
+    assert_eq!(&bytes[at..], b"{}");
 }

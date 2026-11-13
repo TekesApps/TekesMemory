@@ -127,6 +127,60 @@
       },
       "maxItems": 256,
       "minItems": 1
+    },
+    "security_provider": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "credential_file": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "provider_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "policy_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 30000
+        }
+      },
+      "required": [
+        "version",
+        "endpoint",
+        "credential_file",
+        "provider_id",
+        "profile",
+        "policy_version",
+        "purpose",
+        "timeout_ms"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
