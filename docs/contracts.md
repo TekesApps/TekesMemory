@@ -77,3 +77,11 @@ Kernel format-2 扩展均为 Rust，不调用 Python。SQLite 由 rusqlite 的 b
 
 沿用 schema_version=1 和 SQLite user_version=1；保留既有表、操作幂等键与来源身份语义。
 配置 JSON 和工具参数不变。传输输入严格拒绝重复键与非有限数值；工具整数参数由 schema 单独校验。
+
+## 受保护 Store（SecurityProvider v1）
+
+[公开 provider 合同](design/security-provider-v1.md)定义受信 loopback HTTP 接入、访问/载荷/审计/生命周期能力及配置。配置入口为 service.json 的可选 `security_provider`，不由 MCP 请求传入。未保护 Store 保持上述普通语义；保护 Store 使用 schema 2、持久绑定 provider/profile/policy，漏配或旧程序不能降级打开。
+
+保护模式仅保存 opaque episode：保持客户端密文原样，不 scrub、不摘要或截断，索引只使用 provider 核准的 HMAC 词；过大搜索项明确省略并标记 truncated，可按 ID get。强制期限不被 pin 豁免；版本、observations、操作/effect 回执一同外层保护。业务写入与审计 outbox 同事务；正文读取必须先获独立审计持久接受。远端审计失败不伪报已提交写入回滚。普通返回幂等语义不变，新增 security 元数据描述本次审计状态。
+
+已有客户端密文库须停服后显式运行 `security-maintenance --config ... --migrate-opaque`，全库验证/外层封装/索引/marker 同事务提交，失败回滚。轮换用同命令 `--max-rows 64` 有界迁移，保持 owner/记录/内层密文/索引身份。恢复水位不一致进入隔离；不得降低外部水位绕过删除，不宣称提供通用备份恢复引擎。

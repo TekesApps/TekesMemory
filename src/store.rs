@@ -10,6 +10,8 @@ use std::{
 };
 
 pub struct Store {
+    security: Option<crate::security::SecurityProvider>,
+    transaction_generation: std::cell::Cell<i64>,
     pub db: Connection,
     pub episode_days: i64,
     pub clock: fn() -> i64,
@@ -125,14 +127,58 @@ fn query_words(s: &str) -> Vec<String> {
 }
 impl Store {
     pub fn open(path: &Path, episode_days: i64) -> Result<Self> {
+        Self::open_secure(path, episode_days, None)
+    }
+    pub fn open_secure(path: &Path, episode_days: i64, config: Option<&Value>) -> Result<Self> {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;")?;
         let v: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(v, 0 | 1) {
+        if !matches!(v, 0 | 1 | 2) {
             return Err(err("unsupported_database_version"));
         }
         db.execute_batch(include_str!("schema.sql"))?;
+        if v == 0 {
+            db.execute_batch("PRAGMA user_version=1")?;
+        }
+        db.execute_batch("CREATE TABLE IF NOT EXISTS security_audit(id TEXT PRIMARY KEY,event TEXT NOT NULL,state TEXT NOT NULL,error TEXT)")?;
+        let binding: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='security_binding'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if v == 2 && binding.is_none() {
+            return Err(err("unsupported_database_version"));
+        }
+        if binding.is_some() && config.is_none() {
+            return Err(err("security_provider_required"));
+        }
+        let security = if let Some(config) = config {
+            let wanted = canonical(&crate::security::SecurityProvider::binding(config));
+            if binding.as_ref().is_some_and(|v| v != &wanted) {
+                return Err(err("security_profile_mismatch"));
+            }
+            if binding.is_none() {
+                let count: i64 = db.query_row("SELECT (SELECT count(*) FROM records)+(SELECT count(*) FROM versions)+(SELECT count(*) FROM observations)+(SELECT count(*) FROM operations)+(SELECT count(*) FROM effect_receipts)+(SELECT count(*) FROM tombstones)", [], |r| r.get(0))?;
+                if count != 0 {
+                    return Err(err("security_migration_required"));
+                }
+                db.execute_batch("BEGIN IMMEDIATE")?;
+                db.execute("INSERT INTO meta VALUES('security_binding',?)", [&wanted])?;
+                db.execute("INSERT INTO meta VALUES('security_store_id',?)", [uid()])?;
+                db.execute_batch("PRAGMA user_version=2; COMMIT")?;
+            }
+            let id = db.query_row(
+                "SELECT value FROM meta WHERE key='security_store_id'",
+                [],
+                |r| r.get(0),
+            )?;
+            Some(crate::security::SecurityProvider::new(config, id)?)
+        } else {
+            None
+        };
         db.execute(
             "INSERT INTO search_index(search_index,rank) VALUES('secure-delete',1)",
             [],
@@ -152,6 +198,12 @@ impl Store {
             )
             .optional()?;
         if index_version.as_deref() != Some("2") {
+            if security.is_some() {
+                let count: i64 = db.query_row("SELECT count(*) FROM records", [], |r| r.get(0))?;
+                if count != 0 {
+                    return Err(err("security_migration_required"));
+                }
+            }
             db.execute_batch("BEGIN IMMEDIATE; DELETE FROM search_index;")?;
             let docs = {
                 let mut stmt = db
@@ -177,11 +229,431 @@ impl Store {
             db.execute("INSERT INTO meta(key,value) VALUES('search_index_version','2') ON CONFLICT(key) DO UPDATE SET value='2'", [])?;
             db.execute_batch("COMMIT")?;
         }
-        Ok(Self {
+        let store = Self {
             db,
             episode_days,
             clock: now,
-        })
+            security,
+            transaction_generation: std::cell::Cell::new(0),
+        };
+        store.checkpoint("check")?;
+        Ok(store)
+    }
+    /// Explicit offline migration of an existing client-encrypted Store, never an automatic startup fallback.
+    pub fn migrate_opaque(path: &Path, episode_days: i64, config: &Value) -> Result<Self> {
+        let mut store = Self::open(path, episode_days)?;
+        let id = uid();
+        store.security = Some(crate::security::SecurityProvider::new(config, id.clone())?);
+        let operation: Result<()> = (|| {
+            store
+                .security
+                .as_ref()
+                .unwrap()
+                .allow("checkpoint", json!({"mode":"check","generation":0}))?;
+            store.access(
+                &json!({"id":"maintenance","role":"system"}),
+                "migrate",
+                &Value::Null,
+                &Value::Null,
+            )?;
+            store.begin()?;
+            let result = (|| {
+                // Read the legacy values before replacing any current/history pair.
+                let mut rows = Vec::new();
+                for (table, column) in [("records", "doc"), ("versions", "doc")] {
+                    let values = store
+                        .db
+                        .prepare(&format!(
+                            "SELECT rowid,{column} FROM {table} WHERE {column}!='{{}}'"
+                        ))?
+                        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    rows.push((table, values));
+                }
+                store.db.execute("DELETE FROM search_index", [])?;
+                for (table, values) in rows {
+                    for (row, raw) in values {
+                        let record: Value = serde_json::from_str(&raw)?;
+                        store.access(
+                            &json!({"id":"maintenance","role":"system"}),
+                            "migrate",
+                            &record["scope"],
+                            &record,
+                        )?;
+                        let (record, tokens) = store.validate_record(&record)?;
+                        let wrapped = store.encode_stored(&record,json!({"table":"record","id":record["id"],"revision":record["revision"],"scope":record["scope"]}))?;
+                        if table == "records" {
+                            store.db.execute(
+                                "UPDATE records SET doc=?,expires=? WHERE rowid=?",
+                                params![wrapped, record["expires_at"].as_i64(), row],
+                            )?;
+                            if matches!(record["status"].as_str(), Some("active" | "contested")) {
+                                store.db.execute(
+                                    "INSERT INTO search_index VALUES(?,?)",
+                                    params![text(&record, "id")?, tokens],
+                                )?;
+                            }
+                        } else {
+                            store.db.execute(
+                                "UPDATE versions SET doc=? WHERE rowid=?",
+                                params![wrapped, row],
+                            )?;
+                        }
+                    }
+                }
+                let observations = store
+                    .db
+                    .prepare("SELECT id,scope,payload FROM observations WHERE payload!='{}'")?
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, scope, raw) in observations {
+                    let value: Value = serde_json::from_str(&raw)?;
+                    store.security.as_ref().unwrap().allow(
+                        "validate",
+                        json!({"kind":"observation","value":value,"now":(store.clock)()}),
+                    )?;
+                    let wrapped = store.encode_stored(&value,json!({"table":"observation","id":id,"scope":serde_json::from_str::<Value>(&scope)?}))?;
+                    store.db.execute(
+                        "UPDATE observations SET payload=? WHERE id=?",
+                        params![wrapped, id],
+                    )?;
+                }
+                for table in ["operations", "effect_receipts"] {
+                    let rows = store
+                        .db
+                        .prepare(&format!(
+                            "SELECT rowid,principal,scope,key,result FROM {table}"
+                        ))?
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, String>(4)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    for (row, principal, scope, key, raw) in rows {
+                        let context = if table == "operations" {
+                            json!({"table":"operation","principal":principal,"scope":serde_json::from_str::<Value>(&scope)?,"key":key})
+                        } else {
+                            json!({"table":"effect","principal":principal,"key":key})
+                        };
+                        let wrapped = store.encode_stored(&serde_json::from_str(&raw)?, context)?;
+                        store.db.execute(
+                            &format!("UPDATE {table} SET result=? WHERE rowid=?"),
+                            params![wrapped, row],
+                        )?;
+                    }
+                }
+                store.db.execute(
+                    "INSERT INTO meta VALUES('security_binding',?)",
+                    [canonical(&crate::security::SecurityProvider::binding(
+                        config,
+                    ))],
+                )?;
+                store
+                    .db
+                    .execute("INSERT INTO meta VALUES('security_store_id',?)", [id])?;
+                store
+                    .db
+                    .execute("UPDATE meta SET value='1' WHERE key='generation'", [])?;
+                store.db.execute(
+                    "UPDATE meta SET value=? WHERE key='cursor_secret'",
+                    [format!("{}{}", uid(), uid())],
+                )?;
+                store.db.execute_batch("PRAGMA user_version=2")?;
+                store.audit(
+                    &json!({"id":"maintenance"}),
+                    "migrate",
+                    &Value::Null,
+                    "success",
+                    None,
+                )?;
+                store
+                    .security
+                    .as_ref()
+                    .unwrap()
+                    .allow("checkpoint", json!({"mode":"reserve","generation":0}))?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                store.db.execute_batch("ROLLBACK")?;
+                return Err(error);
+            }
+            store.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            store.audit(
+                &json!({"id":"maintenance"}),
+                "migrate",
+                &Value::Null,
+                "denied_or_failed",
+                None,
+            )?;
+            return Err(error);
+        }
+        Ok(store)
+    }
+    fn generation(&self) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='generation'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    fn begin(&self) -> Result<()> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        self.transaction_generation.set(self.generation()?);
+        Ok(())
+    }
+    fn checkpoint(&self, mode: &str) -> Result<()> {
+        if let Some(provider) = &self.security {
+            provider.allow(
+                "checkpoint",
+                json!({"mode":mode,"generation":self.generation()?}),
+            )?;
+        }
+        Ok(())
+    }
+    fn reserve_if_changed(&self) -> Result<()> {
+        if let Some(provider) = &self.security {
+            let before = self.transaction_generation.get();
+            if self.generation()? != before {
+                provider.allow("checkpoint", json!({"mode":"reserve","generation":before}))?;
+            }
+        }
+        Ok(())
+    }
+    fn encode_stored(&self, value: &Value, context: Value) -> Result<String> {
+        match &self.security {
+            Some(p) => p.seal(&context, value),
+            None => Ok(canonical(value)),
+        }
+    }
+    fn decode_stored(&self, raw: &str, context: Option<&Value>) -> Result<Value> {
+        let value = match &self.security {
+            Some(p) => p.open(raw, context)?,
+            None => return Ok(serde_json::from_str(raw)?),
+        };
+        let stored: Value = serde_json::from_str(raw)?;
+        if stored["context"]["table"] == "record"
+            && ["id", "revision", "scope"]
+                .iter()
+                .any(|key| stored["context"][key] != value[key])
+        {
+            return Err(err("security_payload_invalid"));
+        }
+        Ok(value)
+    }
+    fn access(
+        &self,
+        principal: &Value,
+        operation: &str,
+        scope: &Value,
+        resource: &Value,
+    ) -> Result<()> {
+        if let Some(provider) = &self.security {
+            provider.allow("access", json!({"principal":{"id":principal["id"],"role":principal["role"],"owner_id":principal["owner_id"]},
+                "operation":operation,"scope":scope,"resource":resource,"now":(self.clock)()}))?;
+        }
+        Ok(())
+    }
+    fn derived_args(&self, scope: Value, obs: &Value, key: &str) -> Result<Value> {
+        let mut args = derived_record_args(scope, obs, key)?;
+        if let Some(provider) = &self.security {
+            provider.allow(
+                "validate",
+                json!({"kind":"observation","value":obs,"now":(self.clock)()}),
+            )?;
+            args["content"] = obs["payload"]["summary"].clone();
+        }
+        Ok(args)
+    }
+    fn audit(
+        &self,
+        p: &Value,
+        operation: &str,
+        scope: &Value,
+        outcome: &str,
+        operation_id: Option<&str>,
+    ) -> Result<()> {
+        if self.security.is_some() {
+            let operation = if SCHEMAS.contains_key(operation)
+                || matches!(operation, "maintenance" | "rewrap" | "migrate")
+            {
+                operation
+            } else {
+                "unknown"
+            };
+            let event = json!({"schema_version":1,"store_id":self.security.as_ref().unwrap().store_id,"event_id":uid(),"operation":operation,"outcome":outcome,
+                "principal_hash":digest(&p["id"]),"scope_hash":digest(scope),"at":(self.clock)(),"operation_id":operation_id});
+            self.db.execute(
+                "INSERT INTO security_audit VALUES(?,?, 'pending',NULL)",
+                params![text(&event, "event_id")?, canonical(&event)],
+            )?;
+            // Audit-only reads do not change the business generation. Require independent
+            // durable acceptance before releasing content, so restoring an otherwise
+            // identical business snapshot cannot erase a successful read's sole evidence.
+            if self.db.is_autocommit()
+                || (operation.starts_with("memory.")
+                    && self.generation()? == self.transaction_generation.get())
+            {
+                let reply = self
+                    .security
+                    .as_ref()
+                    .unwrap()
+                    .request("audit", json!({"event":event}))?;
+                if reply["accepted"] != true || reply["event_id"] != event["event_id"] {
+                    return Err(err("security_protocol_error"));
+                }
+                self.db.execute(
+                    "UPDATE security_audit SET state='delivered' WHERE id=?",
+                    [text(&event, "event_id")?],
+                )?;
+            }
+        }
+        Ok(())
+    }
+    pub fn deliver_audit(&self) -> Result<usize> {
+        let Some(provider) = &self.security else {
+            return Ok(0);
+        };
+        let rows = self
+            .db
+            .prepare(
+                "SELECT id,event FROM security_audit WHERE state='pending' ORDER BY rowid LIMIT 64",
+            )?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut delivered = 0;
+        for (id, event) in rows {
+            let result = provider.request(
+                "audit",
+                json!({"event":serde_json::from_str::<Value>(&event)?}),
+            );
+            match result {
+                Ok(reply) if reply["accepted"] == true && reply["event_id"] == id => {
+                    self.db.execute(
+                        "UPDATE security_audit SET state='delivered',error=NULL WHERE id=?",
+                        [id],
+                    )?;
+                    delivered += 1;
+                }
+                _ => {
+                    self.db.execute(
+                        "UPDATE security_audit SET error='delivery_pending' WHERE id=?",
+                        [id],
+                    )?;
+                    break;
+                }
+            }
+        }
+        Ok(delivered)
+    }
+    pub fn security_status(&self) -> Result<Value> {
+        let pending: i64 = self.db.query_row(
+            "SELECT count(*) FROM security_audit WHERE state='pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(
+            json!({"protected":self.security.is_some(),"audit_pending":pending,"generation":self.generation()?}),
+        )
+    }
+    /// Rewrap at most `limit` rows, preserving client ciphertext and all row/index identities.
+    pub fn rewrap_batch(&self, limit: usize) -> Result<usize> {
+        let result = self.rewrap_inner(limit);
+        if result.is_err() {
+            self.audit(
+                &json!({"id":"maintenance"}),
+                "rewrap",
+                &Value::Null,
+                "denied_or_failed",
+                None,
+            )?;
+        }
+        result
+    }
+    fn rewrap_inner(&self, limit: usize) -> Result<usize> {
+        let Some(provider) = &self.security else {
+            return Ok(0);
+        };
+        if !(1..=256).contains(&limit) {
+            return Err(err("invalid_argument"));
+        }
+        self.checkpoint("check")?;
+        self.access(
+            &json!({"id":"maintenance","role":"system"}),
+            "rewrap",
+            &Value::Null,
+            &Value::Null,
+        )?;
+        let keys = provider.request("keys", json!({}))?;
+        let current = text(&keys, "write_key_version")?;
+        self.begin()?;
+        let result = (|| {
+            let mut changed = 0;
+            for (table, column) in [
+                ("records", "doc"),
+                ("versions", "doc"),
+                ("observations", "payload"),
+                ("operations", "result"),
+                ("effect_receipts", "result"),
+            ] {
+                let rows = self.db.prepare(&format!("SELECT rowid,{column} FROM {table} WHERE {column}!='{{}}' AND COALESCE(json_extract({column},'$.envelope.key_version'),'')!=? LIMIT ?"))?
+                    .query_map(params![current,(limit-changed) as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>,_>>()?;
+                for (row, raw) in rows {
+                    let stored: Value = serde_json::from_str(&raw)?;
+                    let value = self.decode_stored(&raw, Some(&stored["context"]))?;
+                    let wrapped = provider.seal(&stored["context"], &value)?;
+                    if serde_json::from_str::<Value>(&wrapped)?["envelope"]["key_version"]
+                        != current
+                    {
+                        return Err(err("security_protocol_error"));
+                    }
+                    self.db.execute(
+                        &format!("UPDATE {table} SET {column}=? WHERE rowid=?"),
+                        params![wrapped, row],
+                    )?;
+                    changed += 1;
+                }
+                if changed == limit {
+                    break;
+                }
+            }
+            if changed > 0 {
+                self.bump()?;
+                self.audit(
+                    &json!({"id":"maintenance"}),
+                    "rewrap",
+                    &Value::Null,
+                    "success",
+                    None,
+                )?;
+                self.reserve_if_changed()?;
+            }
+            Ok(changed)
+        })();
+        match result {
+            Ok(count) => {
+                self.commit()?;
+                Ok(count)
+            }
+            Err(e) => {
+                self.db.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
     }
     // A failed COMMIT must not leave the connection inside a partial transaction.
     fn commit(&self) -> Result<()> {
@@ -205,7 +677,7 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         strings
             .iter()
-            .map(|s| Ok(serde_json::from_str(s)?))
+            .map(|s| self.decode_stored(s, None))
             .collect()
     }
     fn strings(&self, sql: &str, args: impl rusqlite::Params) -> Result<Vec<String>> {
@@ -218,10 +690,48 @@ impl Store {
     pub fn call(&self, p: &Value, name: &str, a: &Value) -> Result<Value> {
         self.call_with_effect(p, name, a, None)
     }
+    /// Record an authenticated rejection made at the transport's schema/tool boundary.
+    pub fn audit_rejection(&self, principal: &Value, operation: &str) -> Result<()> {
+        self.audit(principal, operation, &Value::Null, "denied_or_failed", None)
+    }
     pub fn reconcile_effect(&self, p: &Value, key: &str) -> Result<Value> {
+        let result = self.reconcile_effect_inner(p, key);
+        if result.is_err() {
+            self.audit(
+                p,
+                "memory.reconcile_effect",
+                &Value::Null,
+                "denied_or_failed",
+                None,
+            )?;
+        }
+        result
+    }
+    fn reconcile_effect_inner(&self, p: &Value, key: &str) -> Result<Value> {
+        if ![
+            "memory.save",
+            "memory.correct",
+            "memory.forget",
+            "memory.observe",
+        ]
+        .iter()
+        .any(|tool| {
+            p["tools"]
+                .as_array()
+                .is_some_and(|a| a.contains(&json!(tool)))
+        }) {
+            return Err(err("scope_denied"));
+        }
         if !valid_effect_key(key) {
             return Err(err("invalid_argument"));
         }
+        self.checkpoint("check")?;
+        self.access(
+            p,
+            "memory.reconcile_effect",
+            &Value::Null,
+            &json!({"effect_key":key}),
+        )?;
         let row: Option<(String, String)> = self
             .db
             .query_row(
@@ -231,14 +741,61 @@ impl Store {
             )
             .optional()?;
         let Some((scope, result)) = row else {
+            self.audit(p, "memory.reconcile_effect", &Value::Null, "success", None)?;
             return Ok(json!({"status":"not_found"}));
         };
         authorize(p, &serde_json::from_str(&scope)?)?;
-        let data: Value = serde_json::from_str(&result)?;
+        self.access(
+            p,
+            "memory.reconcile_effect",
+            &serde_json::from_str(&scope)?,
+            &json!({"effect_key":key}),
+        )?;
+        let data = self.decode_stored(
+            &result,
+            Some(&json!({"table":"effect","principal":p["id"],"key":key})),
+        )?;
+        self.audit(
+            p,
+            "memory.reconcile_effect",
+            &serde_json::from_str(&scope)?,
+            "success",
+            data["operation_id"].as_str(),
+        )?;
         let envelope = json!({"structuredContent":data,"content":[{"type":"text","text":canonical(&data)}],"isError":false});
         Ok(json!({"status":"confirmed","value":envelope}))
     }
     pub fn call_with_effect(
+        &self,
+        p: &Value,
+        name: &str,
+        a: &Value,
+        effect_key: Option<&str>,
+    ) -> Result<Value> {
+        let result = self.call_inner(p, name, a, effect_key);
+        if self.security.is_some()
+            && (result.is_err() || matches!(name, "memory.get" | "memory.search" | "memory.status"))
+        {
+            self.audit(
+                p,
+                name,
+                &a["scope"],
+                if result.is_ok() {
+                    "success"
+                } else {
+                    "denied_or_failed"
+                },
+                None,
+            )?;
+        }
+        result.map(|mut value| {
+            if self.security.is_some() {
+                value["security"] = json!({"audit_state":if matches!(name,"memory.get"|"memory.search"|"memory.status") { "delivered" } else { "pending" }});
+            }
+            value
+        })
+    }
+    fn call_inner(
         &self,
         p: &Value,
         name: &str,
@@ -260,6 +817,10 @@ impl Store {
         if let Some(scope) = a.get("scope") {
             authorize(p, scope)?;
         }
+        self.checkpoint("check")?;
+        if let Some(scope) = a.get("scope") {
+            self.access(p, name, scope, a)?;
+        }
         if name == "memory.status" {
             let row: Option<(String, String)> = self
                 .db
@@ -271,7 +832,12 @@ impl Store {
                 .optional()?;
             let (s, r) = row.ok_or_else(|| err("not_found"))?;
             authorize(p, &serde_json::from_str(&s)?)?;
-            let r: Value = serde_json::from_str(&r)?;
+            let scope: Value = serde_json::from_str(&s)?;
+            self.access(p, name, &scope, a)?;
+            let r = self.decode_stored(&r, None)?;
+            if r["operation_id"] != a["operation_id"] {
+                return Err(err("security_payload_invalid"));
+            }
             let job: Option<(String, Option<String>)> = self
                 .db
                 .query_row(
@@ -291,11 +857,14 @@ impl Store {
             } else {
                 self.get(a)?
             };
+            if name == "memory.get" {
+                self.access(p, "memory.get", &r["item"]["scope"], &r["item"])?;
+            }
             r["schema_version"] = json!(1);
             r["request_id"] = json!(uid());
             return Ok(r);
         }
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        self.begin()?;
         let r = (|| {
             let scope = canonical(&a["scope"]);
             let dg = digest(&json!({"name":name,"args":a}));
@@ -312,7 +881,10 @@ impl Store {
                     if prior_digest != dg {
                         return Err(err("idempotency_conflict"));
                     }
-                    return Ok(serde_json::from_str(&prior_result)?);
+                    return self.decode_stored(
+                        &prior_result,
+                        Some(&json!({"table":"effect","principal":p["id"],"key":key})),
+                    );
                 }
             }
             let old: Option<(String, String)> = self
@@ -327,12 +899,20 @@ impl Store {
                 if d != dg {
                     return Err(err("idempotency_conflict"));
                 }
-                serde_json::from_str(&result)?
+                self.decode_stored(&result, Some(&json!({"table":"operation","principal":p["id"],"scope":a["scope"],"key":a["idempotency_key"]})))?
             } else {
-                let safe = scrub_write_args(name, a);
+                let safe = if self.security.is_some() {
+                    a.clone()
+                } else {
+                    scrub_write_args(name, a)
+                };
                 let mut r = match name {
                     "memory.save" => self.save(&safe)?,
-                    "memory.correct" => self.correct(&safe)?,
+                    "memory.correct" => {
+                        let current = self.row(&safe["scope"], text(&safe, "id")?)?;
+                        self.access(p, name, &safe["scope"], &current)?;
+                        self.correct(&safe)?
+                    }
                     "memory.forget" => self.forget(&safe)?,
                     "memory.observe" => self.observe(&safe)?,
                     _ => return Err(err("invalid_argument")),
@@ -348,7 +928,7 @@ impl Store {
                         &scope,
                         text(a, "idempotency_key")?,
                         &dg,
-                        canonical(&r)
+                        self.encode_stored(&r, json!({"table":"operation","principal":p["id"],"scope":a["scope"],"key":a["idempotency_key"]}))?
                     ],
                 )?;
                 self.bump()?;
@@ -357,13 +937,34 @@ impl Store {
             if let Some(key) = effect_key {
                 self.db.execute(
                     "INSERT INTO effect_receipts VALUES(?,?,?,?,?)",
-                    params![text(p, "id")?, key, scope, dg, canonical(&r)],
+                    params![
+                        text(p, "id")?,
+                        key,
+                        scope,
+                        dg,
+                        self.encode_stored(
+                            &r,
+                            json!({"table":"effect","principal":p["id"],"key":key})
+                        )?
+                    ],
                 )?;
+                // A new effect receipt can be added while replaying an existing operation.
+                // Its durability must advance the restore watermark as well.
+                if self.generation()? == self.transaction_generation.get() {
+                    self.bump()?;
+                }
             }
             Ok(r)
         })();
         match r {
             Ok(r) => {
+                if let Err(e) = self
+                    .audit(p, name, &a["scope"], "success", r["operation_id"].as_str())
+                    .and_then(|_| self.reserve_if_changed())
+                {
+                    self.db.execute_batch("ROLLBACK")?;
+                    return Err(e);
+                }
                 self.commit()?;
                 Ok(r)
             }
@@ -374,21 +975,28 @@ impl Store {
         }
     }
     fn row(&self, scope: &Value, id: &str) -> Result<Value> {
-        let r: Option<(String, String, Option<i64>)> = self
+        let r: Option<(String, String, Option<i64>, i64)> = self
             .db
             .query_row(
-                "SELECT doc,status,expires FROM records WHERE id=? AND scope=?",
+                "SELECT doc,status,expires,revision FROM records WHERE id=? AND scope=?",
                 params![id, canonical(scope)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let (doc, status, expiry) = r.ok_or_else(|| err("not_found"))?;
+        let (doc, status, expiry, revision) = r.ok_or_else(|| err("not_found"))?;
         if matches!(status.as_str(), "deleted" | "expired")
             || expiry.is_some_and(|e| e <= (self.clock)())
         {
             return Err(err("not_found"));
         }
-        Ok(serde_json::from_str(&doc)?)
+        let record = self.decode_stored(
+            &doc,
+            Some(&json!({"table":"record","id":id,"revision":revision,"scope":scope})),
+        )?;
+        if record["id"] != id || record["scope"] != *scope {
+            return Err(err("security_payload_invalid"));
+        }
+        Ok(record)
     }
     fn fact_key(r: &Value) -> Option<String> {
         r.get("fact").map(|f|digest(&json!({"subject":f["subject"],"predicate":f["predicate"],"environment":f["environment"]})))
@@ -415,10 +1023,14 @@ impl Store {
         }
         .into())
     }
-    fn search_hit(mut record: Value, query: &str, available_bytes: usize) -> Option<Value> {
+    fn search_hit(&self, mut record: Value, query: &str, available_bytes: usize) -> Option<Value> {
         let original = record["content"].as_str()?.to_owned();
         if canonical(&record).len() <= available_bytes {
             return Some(record);
+        }
+
+        if self.security.is_some() {
+            return None;
         }
 
         // Keep the matching passage when possible, then fit it to the remaining
@@ -466,6 +1078,16 @@ impl Store {
                 .next()
                 .ok_or_else(|| err("not_found"))?;
             let historical = *rev != r["revision"];
+            if old["id"] != a["id"] || old["revision"] != *rev || old["scope"] != a["scope"] {
+                return Err(err("security_payload_invalid"));
+            }
+            if self.security.is_some()
+                && old["expires_at"]
+                    .as_i64()
+                    .is_none_or(|e| e <= (self.clock)())
+            {
+                return Err(err("not_found"));
+            }
             r = old;
             r["historical"] = json!(historical)
         }
@@ -478,10 +1100,61 @@ impl Store {
         ensure_record_readable(&r)?;
         Ok(json!({"item":r}))
     }
+    fn validate_record(&self, r: &Value) -> Result<(Value, Option<String>)> {
+        let mut r = r.clone();
+        let tokens = if let Some(provider) = &self.security {
+            if r["kind"] != "episode" {
+                return Err(err("security_payload_invalid"));
+            }
+            let policy = provider.allow(
+                "validate",
+                json!({"kind":"record","value":r,"now":(self.clock)()}),
+            )?;
+            let deadline = policy["expires_at"]
+                .as_i64()
+                .filter(|n| *n > (self.clock)())
+                .ok_or_else(|| err("security_denied"))?;
+            r["expires_at"] = json!(
+                r["expires_at"]
+                    .as_i64()
+                    .map_or(deadline, |n| n.min(deadline))
+            );
+            let tokens = array(&policy, "index_tokens")?;
+            if tokens.len() > 4096
+                || tokens.iter().any(|v| {
+                    v.as_str().is_none_or(|t| {
+                        (t.len() != 64 && !(t.len() == 65 && t.starts_with('h')))
+                            || !t
+                                .strip_prefix('h')
+                                .unwrap_or(t)
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                })
+            {
+                return Err(err("security_protocol_error"));
+            }
+            Some(
+                tokens
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        } else {
+            None
+        };
+        Ok((r, tokens))
+    }
     fn put(&self, r: &Value) -> Result<()> {
         ensure_record_readable(r)?;
         let id = text(r, "id")?;
-        let doc = canonical(r);
+        let (r, tokens) = self.validate_record(r)?;
+        let r = &r;
+        let doc = self.encode_stored(
+            r,
+            json!({"table":"record","id":id,"revision":r["revision"],"scope":r["scope"]}),
+        )?;
         self.db.execute(
             "INSERT OR REPLACE INTO records VALUES(?,?,?,?,?,?,?,?)",
             params![
@@ -506,12 +1179,12 @@ impl Store {
                 "INSERT INTO search_index VALUES(?,?)",
                 params![
                     id,
-                    words(&format!(
+                    tokens.unwrap_or_else(|| words(&format!(
                         "{} {}",
-                        text(r, "content")?,
+                        text(r, "content").unwrap(),
                         canonical(&r["fact"])
                     ))
-                    .join(" ")
+                    .join(" "))
                 ],
             )?;
         }
@@ -565,7 +1238,7 @@ impl Store {
         if a["verified_at"].as_i64().is_some_and(|n| n > now) {
             return Err(err("invalid_argument"));
         }
-        let expires = if a["pinned"] == true {
+        let expires = if a["pinned"] == true && self.security.is_none() {
             Value::Null
         } else {
             a.get("expires_at").cloned().unwrap_or_else(|| {
@@ -697,7 +1370,7 @@ impl Store {
             )?.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             for (id, own_key, payload, job_state) in rows {
-                let payload: Value = serde_json::from_str(&payload)?;
+                let payload = self.decode_stored(&payload, Some(&json!({"table":"observation","id":id,"scope":serde_json::from_str::<Value>(scope)?})))?;
                 let depends_on_key = own_key == key
                     || payload["payload"]["own_source_key"] == key
                     || payload["payload"]["sources"]
@@ -848,6 +1521,12 @@ impl Store {
         {
             return Err(err("scope_denied"));
         }
+        if let Some(provider) = &self.security {
+            provider.allow(
+                "validate",
+                json!({"kind":"observation","value":obs,"now":(self.clock)()}),
+            )?;
+        }
         let typ = text(obs, "type")?;
         let required: &[&str] = match typ {
             "turn_opened" => &[],
@@ -874,7 +1553,7 @@ impl Store {
         let key = digest(&identity);
         let mut blocked = false;
         if typ != "source_invalidated" {
-            let record_args = derived_record_args(a["scope"].clone(), obs, &key)?;
+            let record_args = self.derived_args(a["scope"].clone(), obs, &key)?;
             for source in array(&record_args, "sources")? {
                 if let Some(source_key) = source["source_key"].as_str()
                     && self
@@ -904,7 +1583,12 @@ impl Store {
         }
         let old:Option<(String,String,String)>=self.db.query_row("SELECT id,state,payload FROM observations WHERE scope=? AND source_key=? AND digest=?",params![scope,key,text(event,"source_digest")?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((id, state, payload)) = old {
-            if !matches!(state.as_str(), "deleted" | "expired") && payload != canonical(obs) {
+            if !matches!(state.as_str(), "deleted" | "expired")
+                && self.decode_stored(
+                    &payload,
+                    Some(&json!({"table":"observation","id":id,"scope":a["scope"]})),
+                )? != *obs
+            {
                 return Err(err("idempotency_conflict"));
             }
             return Ok(
@@ -960,7 +1644,10 @@ impl Store {
                 scope,
                 key,
                 text(event, "source_digest")?,
-                canonical(obs),
+                self.encode_stored(
+                    obs,
+                    json!({"table":"observation","id":id,"scope":a["scope"]})
+                )?,
                 state
             ],
         )?;
@@ -984,7 +1671,28 @@ impl Store {
         Ok(json!({"accepted":true,"observation_id":id,"processing_state":state,"source_key":key}))
     }
     pub fn maintain(&self) -> Result<bool> {
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.maintain_inner();
+        if result.is_err() {
+            self.audit(
+                &json!({"id":"maintenance"}),
+                "maintenance",
+                &Value::Null,
+                "denied_or_failed",
+                None,
+            )?;
+        }
+        result
+    }
+    fn maintain_inner(&self) -> Result<bool> {
+        self.deliver_audit()?;
+        self.checkpoint("check")?;
+        self.access(
+            &json!({"id":"maintenance","role":"system"}),
+            "maintenance",
+            &Value::Null,
+            &Value::Null,
+        )?;
+        self.begin()?;
         let mut job_id = None;
         let mut attempts = 0;
         let result = (|| {
@@ -1016,8 +1724,8 @@ impl Store {
             if let Some((id, count, scope, payload, key)) = job {
                 job_id = Some(id.clone());
                 attempts = count;
-                let obs: Value = serde_json::from_str(&payload)?;
-                let record_args = derived_record_args(serde_json::from_str(&scope)?, &obs, &key)?;
+                let obs = self.decode_stored(&payload, Some(&json!({"table":"observation","id":id,"scope":serde_json::from_str::<Value>(&scope)?})))?;
+                let record_args = self.derived_args(serde_json::from_str(&scope)?, &obs, &key)?;
                 let mut blocked = false;
                 for source in array(&record_args, "sources")? {
                     if let Some(source_key) = source["source_key"].as_str()
@@ -1042,8 +1750,15 @@ impl Store {
                         dependent_ids.extend(self.strings("SELECT d.record_id FROM dependencies d JOIN records r ON r.id=d.record_id WHERE r.scope=? AND d.source_key=?",params![scope,invalidated_key])?);
                     }
                     self.erase(&scope, dependent_ids, true)?;
+                    self.bump()?;
                     return Ok(());
                 }
+                self.access(
+                    &json!({"id":"maintenance","role":"system"}),
+                    "derive",
+                    &record_args["scope"],
+                    &record_args,
+                )?;
                 let saved = self.save(&record_args)?;
                 self.db.execute(
                     "UPDATE observations SET state='completed',record_id=? WHERE id=?",
@@ -1061,10 +1776,28 @@ impl Store {
         })();
         match result {
             Ok(()) => {
+                if let Err(e) = (|| {
+                    if self.generation()? != self.transaction_generation.get() {
+                        self.audit(
+                            &json!({"id":"maintenance"}),
+                            "maintenance",
+                            &Value::Null,
+                            "success",
+                            None,
+                        )?;
+                    }
+                    self.reserve_if_changed()
+                })() {
+                    self.db.execute_batch("ROLLBACK")?;
+                    return Err(e);
+                }
                 self.commit()?;
             }
             Err(e) => {
                 self.db.execute_batch("ROLLBACK")?;
+                if self.security.is_some() {
+                    return Err(e);
+                }
                 if let Some(id) = &job_id {
                     let n = attempts + 1;
                     self.db.execute("UPDATE jobs SET state=?,attempts=?,next_at=?,error='processing_failed' WHERE id=?",params![if n>=5{"failed"}else{"accepted"},n,(self.clock)()+(1i64<<n),id])?;
@@ -1181,6 +1914,21 @@ impl Store {
             .min(a["budget"]["estimated_tokens"].as_u64().unwrap()) as usize;
         let mut omitted_for_budget = false;
         for mut r in rows.clone() {
+            if self.security.is_some() {
+                let revision: Option<i64> = self
+                    .db
+                    .query_row(
+                        "SELECT revision FROM records WHERE id=? AND scope=?",
+                        params![text(&r, "id")?, canonical(&r["scope"])],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if revision != r["revision"].as_i64() {
+                    return Err(err("security_payload_invalid"));
+                }
+            }
+            authorize(p, &r["scope"])?;
+            self.access(p, "memory.search", &r["scope"], &r)?;
             if !self.valid(&r["fact"]) {
                 consumed += 1;
                 continue;
@@ -1193,12 +1941,14 @@ impl Store {
             let contested = r["status"] == "contested";
             let used = canonical(&json!({"items":items,"conflicts":conflicts})).len();
             let remaining_record_bytes = cap.saturating_sub(used.saturating_add(1));
-            let Some(r) = Self::search_hit(r.clone(), text(a, "query")?, remaining_record_bytes)
+            let Some(r) = self.search_hit(r.clone(), text(a, "query")?, remaining_record_bytes)
             else {
                 let empty_reference_bytes = canonical(&json!({"items":[],"conflicts":[]})).len();
                 let fresh_page_record_bytes =
                     cap.saturating_sub(empty_reference_bytes.saturating_add(1));
-                if Self::search_hit(r.clone(), text(a, "query")?, fresh_page_record_bytes).is_some()
+                if self
+                    .search_hit(r.clone(), text(a, "query")?, fresh_page_record_bytes)
+                    .is_some()
                 {
                     // This result fits on a new page; leave it unconsumed so the
                     // signed cursor resumes at this row instead of losing it.

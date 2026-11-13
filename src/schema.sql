@@ -18,5 +18,4 @@
         CREATE TABLE IF NOT EXISTS dependencies(record_id TEXT,source_key TEXT,PRIMARY KEY(record_id,source_key));
         CREATE TABLE IF NOT EXISTS tombstones(scope TEXT,source_key TEXT,PRIMARY KEY(scope,source_key));
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-        PRAGMA user_version=1;
         COMMIT;

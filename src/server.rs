@@ -109,8 +109,10 @@ impl ServerHandler for MemoryHandler {
                         .is_some_and(|tools| tools.contains(&json!(tool)))
                 });
                 if !may_write {
+                    inner.store.lock().unwrap().audit_rejection(&p, &name)?;
                     Err(err("scope_denied"))
                 } else if let Err(e) = validate(&args, &SCHEMAS["memory.reconcile_effect"]) {
+                    inner.store.lock().unwrap().audit_rejection(&p, &name)?;
                     Err(e)
                 } else {
                     inner
@@ -463,10 +465,14 @@ pub async fn serve(config_path: &Path, ready: Option<&Path>) -> Result<()> {
             return Err(err("unsafe_database_path"));
         }
     }
-    let store = Store::open(
-        &dir.join("memory.sqlite3"),
-        c["episode_days"].as_i64().unwrap(),
-    )?;
+    let store_path = dir.join("memory.sqlite3");
+    let episode_days = c["episode_days"].as_i64().unwrap();
+    let security = c.get("security_provider").cloned();
+    let store = tokio::task::spawn_blocking(move || {
+        Store::open_secure(&store_path, episode_days, security.as_ref())
+    })
+    .await
+    .map_err(|_| err("storage_error"))??;
     let listener =
         tokio::net::TcpListener::bind(("127.0.0.1", c["port"].as_u64().unwrap() as u16)).await?;
     let port = listener.local_addr()?.port();
