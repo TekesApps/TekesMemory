@@ -129,6 +129,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-with open(root + "/ready.json", "w") as f:
+with open(root + "/ready.json.tmp", "w") as f:
     json.dump({"port": server.server_port}, f)
+os.replace(root + "/ready.json.tmp", root + "/ready.json")
 server.serve_forever()
